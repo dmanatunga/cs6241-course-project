@@ -66,6 +66,7 @@ namespace {
     bool computeAllocSize(Value *Ptr, APInt &Offset, Value* &OffsetValue,
                           APInt &Size, Value* &SizeValue);
     bool instrument(Value *Ptr, Value *Val);
+    bool LocalAnalysis(BasicBlock *blk);
  };
 }
 
@@ -77,7 +78,7 @@ INITIALIZE_PASS(BoundsChecking, "bounds-checking", "Run-time bounds checking",
 /// getTrapBB - create a basic block that traps. All overflowing conditions
 /// branch to this block. There's only one trap block per function.
 BasicBlock *BoundsChecking::getTrapBB() {
-  if (TrapBB && SingleTrapBB)
+  if (TrapBB)
     return TrapBB;
 
   Function *Fn = Inst->getParent()->getParent();
@@ -142,10 +143,16 @@ bool BoundsChecking::instrument(Value *Ptr, Value *InstVal) {
   Value *Size   = SizeOffset.first;
   Value *Offset = SizeOffset.second;
   ConstantInt *SizeCI = dyn_cast<ConstantInt>(Size);
-
+  
   Type *IntTy = TD->getIntPtrType(Ptr->getType());
   Value *NeededSizeVal = ConstantInt::get(IntTy, NeededSize);
 
+  /**
+  errs() << "===========================\n";
+  errs() << "Array: " << Ptr->getName() << "\n";
+  errs() << "Index: " << *Offset <<  "\n";
+  errs() << " Size : " << *Size << "\n";
+  */
   // three checks are required to ensure safety:
   // . Offset >= 0  (since the offset is given from the base ptr)
   // . Size >= Offset  (unsigned)
@@ -167,26 +174,203 @@ bool BoundsChecking::instrument(Value *Ptr, Value *InstVal) {
   return true;
 }
 
-bool BoundsChecking::runOnFunction(Function &F) {
-  TD = &getAnalysis<DataLayout>();
-  TLI = &getAnalysis<TargetLibraryInfo>();
 
-  TrapBB = 0;
-  BuilderTy TheBuilder(F.getContext(), TargetFolder(TD));
-  Builder = &TheBuilder;
-  ObjectSizeOffsetEvaluator TheObjSizeEval(TD, TLI, F.getContext());
-  ObjSizeEval = &TheObjSizeEval;
-
+bool BoundsChecking::LocalAnalysis(BasicBlock *blk) {
   // check HANDLE_MEMORY_INST in include/llvm/Instruction.def for memory
   // touching instructions
   std::vector<Instruction*> WorkList;
-  for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
+  // Iterate over instructions in the basic block and build the constraint graph
+  for (BasicBlock::iterator i = blk->begin(), e = blk->end(); i != e; ++i) {
+    Instruction *I = &*i;
+    errs() << "===========================================\n"; 
+    if (isa<CallInst>(I)) {
+      // Function call instruction, we must kill all variables
+      errs() << "Function Call: " << *I << "\n"; 
+    } else if (I->isCast()) {
+      // If cast, basically set output equal to input
+      errs() << "Cast Operator: " << *I << "\n";
+      Value *op1 = I->getOperand(0);
+      errs() << "Casting: " << *op1 << "\n";
+    } else if (isa<LoadInst>(I)) {
+      // If a load, associate register with memory identifier
+      errs() << "Load Operator: " << *I << "\n";
+      Value *op1 = I->getOperand(0);
+      errs() << "Loading From: " << *op1 << "\n";
+      errs() << "Loading To: " << *I << "\n";
+    } else if (isa<StoreInst>(I)) {
+      // If a store instruction, we need to set that memory location to value in graph
+      errs() << "Store Operator: " << *I << "\n";
+      Value *op1 = I->getOperand(0);
+      Value *op2 = I->getOperand(1);
+
+      ConstantInt *ConstVal = dyn_cast<ConstantInt>(op1);
+      if (ConstVal != NULL) {
+        errs() << "Storing Value: " << ConstVal->getSExtValue() << "\n";
+      } else {
+        errs() << "Storing From: " << *op1 << "\n";
+      }
+     
+      AllocaInst *allocInst = dyn_cast<AllocaInst>(op2);
+      GlobalValue *global = dyn_cast<GlobalValue>(op2);
+      if (allocInst != NULL || global != NULL) {
+        errs() << "Storing To: " << *op2 << "\n";
+      } else {
+        errs() << "Storing To Pointer Location: " << *op2 << "\n";
+      }
+    } else if (I->isBinaryOp()) {
+      unsigned opcode = I->getOpcode();
+      if (opcode == Instruction::Add) {
+          int64_t val = 0;
+          Value *var = NULL;
+          errs() << "Add Operator: " << *I << "\n";
+          Value *op1 = I->getOperand(0);
+          Value *op2 = I->getOperand(1);
+
+          ConstantInt *ConstVal1 = dyn_cast<ConstantInt>(op1);
+          ConstantInt *ConstVal2 = dyn_cast<ConstantInt>(op2);
+
+          if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
+            // We know both operands so can just create blank node with value
+            val = ConstVal1->getSExtValue() + ConstVal2->getSExtValue();
+          } else if (ConstVal1 != NULL) {
+            val = ConstVal1->getSExtValue();
+            var = op2;
+            errs() << *var << "\n";
+            errs() << "Constant: " << val << "\n";
+          } else if (ConstVal2 != NULL) {
+            var = op1;
+            val = ConstVal2->getSExtValue();
+            errs() << *var << "\n";
+            errs() << "Constant: " << val << "\n";
+          } else {
+            // Both operands are variables, so we must just create blank node
+          }
+      } else if (opcode == Instruction::Sub) {
+          int64_t val = 0;
+          Value *var = NULL;
+          errs() << "Subtraction Operator: " << *I << "\n";
+          Value *op1 = I->getOperand(0);
+          Value *op2 = I->getOperand(1);
+
+          ConstantInt *ConstVal1 = dyn_cast<ConstantInt>(op1);
+          ConstantInt *ConstVal2 = dyn_cast<ConstantInt>(op2);
+
+          if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
+            // We know both operands so can just create blank node with value
+            val = ConstVal1->getSExtValue() - ConstVal2->getSExtValue();
+          } else if (ConstVal1 != NULL) {
+            // Second operand is variable so we can't determine much about operation
+          } else if (ConstVal2 != NULL) {
+            var = op1;
+            val = -ConstVal2->getSExtValue();
+            errs() << *var << "\n";
+            errs() << "Constant: " << val << "\n";
+          } else {
+            // Both operands are variables, so we must just create blank node
+          }
+      } else if (opcode == Instruction::Mul) {
+          int64_t val = 0;
+          Value *var = NULL;
+          errs() << "Multiply Operator: " << *I << "\n";
+          Value *op1 = I->getOperand(0);
+          Value *op2 = I->getOperand(1);
+
+          ConstantInt *ConstVal1 = dyn_cast<ConstantInt>(op1);
+          ConstantInt *ConstVal2 = dyn_cast<ConstantInt>(op2);
+
+          if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
+            // We know both operands so can just create blank node with value
+            val = ConstVal1->getSExtValue()*ConstVal2->getSExtValue();
+          } else if (ConstVal1 != NULL) {
+            val = ConstVal1->getSExtValue();
+            var = op2;
+            errs() << *var << "\n";
+            errs() << "Constant: " << val << "\n";
+          } else if (ConstVal2 != NULL) {
+            var = op1;
+            val = ConstVal2->getSExtValue();
+            errs() << *var << "\n";
+            errs() << "Constant: " << val << "\n";
+          } else {
+            // Both operands are variables, so we must just create blank node
+          }
+      } else if (opcode == Instruction::UDiv) {
+          int64_t val = 0;
+          Value *var = NULL;
+          errs() << "Unsigned Division Operator: " << *I << "\n";
+          Value *op1 = I->getOperand(0);
+          Value *op2 = I->getOperand(1);
+
+          ConstantInt *ConstVal1 = dyn_cast<ConstantInt>(op1);
+          ConstantInt *ConstVal2 = dyn_cast<ConstantInt>(op2);
+
+          if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
+            // We know both operands so can just create blank node with value
+            val = (int64_t)(ConstVal1->getZExtValue()/ConstVal2->getZExtValue());
+          } else if (ConstVal1 != NULL) {
+            // Second operand is variable so we can't determine much about operation
+          } else if (ConstVal2 != NULL) {
+            var = op1;
+            val = (int64_t)ConstVal2->getZExtValue();
+            errs() << *var << "\n";
+            errs() << "Constant: " << val << "\n";
+          } else {
+            // Both operands are variables, so we must just create blank node
+          }
+      } else if (opcode == Instruction::SDiv) {
+          int64_t val = 0;
+          Value *var = NULL;
+          errs() << "Signed Division Operator: " << *I << "\n";
+          Value *op1 = I->getOperand(0);
+          Value *op2 = I->getOperand(1);
+
+          ConstantInt *ConstVal1 = dyn_cast<ConstantInt>(op1);
+          ConstantInt *ConstVal2 = dyn_cast<ConstantInt>(op2);
+
+          if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
+            // We know both operands so can just create blank node with value
+            val = ConstVal1->getSExtValue() + ConstVal2->getSExtValue();
+          } else if (ConstVal1 != NULL) {
+            // Second operand is variable so we can't determine much about operation
+          } else if (ConstVal2 != NULL) {
+            var = op1;
+            val = ConstVal2->getSExtValue();
+            
+          } else {
+            // Both operands are variables, so we must just create blank node
+          }
+          errs() << *var << "\n";
+          errs() << "Constant: " << val << "\n";
+      } else {
+        errs() << "Handle opcode: " << I->getOpcodeName() << "?\n";
+      }
+    } else {
+      errs() << "Handle opcode: " << I->getOpcodeName() << "?\n";
+    }
+
+
+
+    if (I->mayWriteToMemory()) {
+      // Instruction writes to memory, so kill other definitions
+    }
+
+    // Add to bounds checking creator list    
+    if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicCmpXchgInst>(I) ||
+        isa<AtomicRMWInst>(I)) {
+      //  errs() << *i << "\n";
+        WorkList.push_back(I);
+    }
+  }
+  
+  // Iterate over instructions in the basic block and build the constraint graph
+  for (BasicBlock::iterator i = blk->begin(), e = blk->end(); i != e; ++i) {
     Instruction *I = &*i;
     if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicCmpXchgInst>(I) ||
-        isa<AtomicRMWInst>(I))
+        isa<AtomicRMWInst>(I)) {
+      //  errs() << *i << "\n";
         WorkList.push_back(I);
+    }
   }
-
   bool MadeChange = false;
   for (std::vector<Instruction*>::iterator i = WorkList.begin(),
        e = WorkList.end(); i != e; ++i) {
@@ -204,6 +388,33 @@ bool BoundsChecking::runOnFunction(Function &F) {
     } else {
       llvm_unreachable("unknown Instruction type");
     }
+  }
+  return MadeChange;
+}
+
+
+bool BoundsChecking::runOnFunction(Function &F) {
+  TD = &getAnalysis<DataLayout>();
+  TLI = &getAnalysis<TargetLibraryInfo>();
+
+  TrapBB = 0;
+  BuilderTy TheBuilder(F.getContext(), TargetFolder(TD));
+  Builder = &TheBuilder;
+  ObjectSizeOffsetEvaluator TheObjSizeEval(TD, TLI, F.getContext());
+  ObjSizeEval = &TheObjSizeEval;
+
+  std::vector<BasicBlock*> BBWorkList;
+  // Iterate over the Basic Blocks and perform local analysis
+  for (Function::iterator i = F.begin(), e = F.end(); i != e; ++i) {
+    errs() << "Basic block (name=" << i->getName() << ") has " << i->size() << "instructions.\n";
+    BasicBlock *blk = &*i;
+    BBWorkList.push_back(blk);
+  }
+
+  bool MadeChange = false;
+  for (std::vector<BasicBlock*>::iterator i = BBWorkList.begin(),
+       e = BBWorkList.end(); i != e; ++i) {
+    MadeChange |= LocalAnalysis(*i);
   }
   return MadeChange;
 }
