@@ -27,6 +27,7 @@
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Transforms/Instrumentation.h"
 using namespace llvm;
+#include "BoundsCheck.hpp"
 
 static cl::opt<bool> SingleTrapBB("bounds-checking-single-trap",
                                   cl::desc("Use one trap block per function"));
@@ -66,7 +67,13 @@ namespace {
     bool computeAllocSize(Value *Ptr, APInt &Offset, Value* &OffsetValue,
                           APInt &Size, Value* &SizeValue);
     bool instrument(Value *Ptr, Value *Val);
+
+    // Local Analysis Functions
     bool LocalAnalysis(BasicBlock *blk);
+    void IdentifyBoundsChecks(BasicBlock *blk, std::vector<BoundsCheck*> *boundsChecks);
+    BoundsCheck* createBoundsCheck(Instruction *Inst, Value *Ptr, Value *Val);
+    bool canDetermineCheckAtCompileTime(Value *Cmp = 0);
+    void buildConstraintGraph(BasicBlock *blk);
  };
 }
 
@@ -175,9 +182,9 @@ bool BoundsChecking::instrument(Value *Ptr, Value *InstVal) {
 }
 
 
-bool BoundsChecking::LocalAnalysis(BasicBlock *blk) {
-  // check HANDLE_MEMORY_INST in include/llvm/Instruction.def for memory
-  // touching instructions
+
+void BoundsChecking::buildConstraintGraph(BasicBlock *blk) {
+
   std::vector<Instruction*> WorkList;
   // Iterate over instructions in the basic block and build the constraint graph
   for (BasicBlock::iterator i = blk->begin(), e = blk->end(); i != e; ++i) {
@@ -191,31 +198,41 @@ bool BoundsChecking::LocalAnalysis(BasicBlock *blk) {
       errs() << "Cast Operator: " << *I << "\n";
       Value *op1 = I->getOperand(0);
       errs() << "Casting: " << *op1 << "\n";
+    } else if (isa<GetElementPtrInst>(I)) {
+      errs() << "Get Element Pointer: " << *I << "\n";
+      Value *index = I->getOperand(I->getNumOperands()-1);
+      errs() << "Index: " << *index << "\n";
     } else if (isa<LoadInst>(I)) {
       // If a load, associate register with memory identifier
       errs() << "Load Operator: " << *I << "\n";
-      Value *op1 = I->getOperand(0);
+      LoadInst *LI = dyn_cast<LoadInst>(I);
+      Value *op1 = LI->getPointerOperand();
       errs() << "Loading From: " << *op1 << "\n";
       errs() << "Loading To: " << *I << "\n";
     } else if (isa<StoreInst>(I)) {
       // If a store instruction, we need to set that memory location to value in graph
       errs() << "Store Operator: " << *I << "\n";
-      Value *op1 = I->getOperand(0);
-      Value *op2 = I->getOperand(1);
-
-      ConstantInt *ConstVal = dyn_cast<ConstantInt>(op1);
+      StoreInst *SI = dyn_cast<StoreInst>(I);
+      Value *to = SI->getPointerOperand();
+      Value *from = SI->getValueOperand();
+      ConstantInt *ConstVal = dyn_cast<ConstantInt>(from);
       if (ConstVal != NULL) {
         errs() << "Storing Value: " << ConstVal->getSExtValue() << "\n";
       } else {
-        errs() << "Storing From: " << *op1 << "\n";
+        errs() << "Storing From: " << *from << "\n";
       }
-     
-      AllocaInst *allocInst = dyn_cast<AllocaInst>(op2);
-      GlobalValue *global = dyn_cast<GlobalValue>(op2);
-      if (allocInst != NULL || global != NULL) {
-        errs() << "Storing To: " << *op2 << "\n";
+    
+       
+      //AllocaInst *allocInst = dyn_cast<AllocaInst>(to);
+      //GlobalValue *global = dyn_cast<GlobalValue>(to);
+      //bool isPointer = (allocInst == NULL && global == NULL);
+      
+      Type* T = to->getType();
+      bool isPointer = T->isPointerTy() && T->getContainedType(0)->isPointerTy();
+      if (isPointer) {
+        errs() << "Storing To Pointer Location: " << *to << "\n";
       } else {
-        errs() << "Storing To Pointer Location: " << *op2 << "\n";
+        errs() << "Storing To: " << *to << "\n";
       }
     } else if (I->isBinaryOp()) {
       unsigned opcode = I->getOpcode();
@@ -346,52 +363,103 @@ bool BoundsChecking::LocalAnalysis(BasicBlock *blk) {
       }
     } else {
       errs() << "Handle opcode: " << I->getOpcodeName() << "?\n";
-    }
-
-
-
-    if (I->mayWriteToMemory()) {
-      // Instruction writes to memory, so kill other definitions
-    }
-
-    // Add to bounds checking creator list    
-    if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicCmpXchgInst>(I) ||
-        isa<AtomicRMWInst>(I)) {
-      //  errs() << *i << "\n";
-        WorkList.push_back(I);
+      errs() << *I << "\n";
     }
   }
-  
-  // Iterate over instructions in the basic block and build the constraint graph
-  for (BasicBlock::iterator i = blk->begin(), e = blk->end(); i != e; ++i) {
-    Instruction *I = &*i;
-    if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<AtomicCmpXchgInst>(I) ||
-        isa<AtomicRMWInst>(I)) {
-      //  errs() << *i << "\n";
-        WorkList.push_back(I);
-    }
-  }
-  bool MadeChange = false;
-  for (std::vector<Instruction*>::iterator i = WorkList.begin(),
-       e = WorkList.end(); i != e; ++i) {
-    Inst = *i;
-
-    Builder->SetInsertPoint(Inst);
-    if (LoadInst *LI = dyn_cast<LoadInst>(Inst)) {
-      MadeChange |= instrument(LI->getPointerOperand(), LI);
-    } else if (StoreInst *SI = dyn_cast<StoreInst>(Inst)) {
-      MadeChange |= instrument(SI->getPointerOperand(), SI->getValueOperand());
-    } else if (AtomicCmpXchgInst *AI = dyn_cast<AtomicCmpXchgInst>(Inst)) {
-      MadeChange |= instrument(AI->getPointerOperand(),AI->getCompareOperand());
-    } else if (AtomicRMWInst *AI = dyn_cast<AtomicRMWInst>(Inst)) {
-      MadeChange |= instrument(AI->getPointerOperand(), AI->getValOperand());
-    } else {
-      llvm_unreachable("unknown Instruction type");
-    }
-  }
-  return MadeChange;
 }
 
+void BoundsChecking::IdentifyBoundsChecks(BasicBlock *blk, std::vector<BoundsCheck*> *boundsChecks) {
+  for (BasicBlock::iterator i = blk->begin(), e = blk->end(); i != e; ++i) {
+    Instruction *Inst = &*i;
+    BoundsCheck *check = NULL;
+    if (LoadInst *LI = dyn_cast<LoadInst>(Inst)) {
+      check = createBoundsCheck(Inst, LI->getPointerOperand(), LI);
+    } else if (StoreInst *SI = dyn_cast<StoreInst>(Inst)) {
+      check = createBoundsCheck(Inst, SI->getPointerOperand(), SI->getValueOperand());
+    } else if (AtomicCmpXchgInst *AI = dyn_cast<AtomicCmpXchgInst>(Inst)) {
+      check = createBoundsCheck(Inst, AI->getPointerOperand(),AI->getCompareOperand());
+    } else if (AtomicRMWInst *AI = dyn_cast<AtomicRMWInst>(Inst)) {
+      check = createBoundsCheck(Inst, AI->getPointerOperand(), AI->getValOperand());
+    } 
+
+    if (check != NULL) {
+      boundsChecks->push_back(check);
+    }
+  }
+}
+
+/// If Cmp is non-null, perform a jump only if its value evaluates to true.
+bool BoundsChecking::canDetermineCheckAtCompileTime(Value *Cmp) {
+  // check if the comparison is always false
+  ConstantInt *C = dyn_cast_or_null<ConstantInt>(Cmp);
+  if (C && (!C->getZExtValue())) {
+      errs() << *C << "\n";
+      return true;
+  }
+  return false;
+}
+
+/// Ptr is the pointer that will be read/written, and InstVal is either the
+/// result from the load or the value being stored. It is used to determine the
+/// size of memory block that is touched.
+/// Returns true if any change was made to the IR, false otherwise.
+BoundsCheck* BoundsChecking::createBoundsCheck(Instruction *Inst, Value *Ptr, Value *InstVal) {
+  uint64_t NeededSize = TD->getTypeStoreSize(InstVal->getType());
+  SizeOffsetEvalType SizeOffset = ObjSizeEval->compute(Ptr);
+  
+  BoundsCheck *check = NULL;
+  if (!ObjSizeEval->bothKnown(SizeOffset)) {
+    return check;
+  }
+
+  Value *Size   = SizeOffset.first;
+  Value *Offset = SizeOffset.second;
+  ConstantInt *SizeCI = dyn_cast<ConstantInt>(Size);
+  ConstantInt *OffsetCI = dyn_cast<ConstantInt>(Offset);  
+
+  // three checks are required to ensure safety:
+  // . Offset >= 0  (since the offset is given from the base ptr)
+  // . Size >= Offset  (unsigned)
+  // . Size - Offset >= NeededSize  (unsigned)
+  //
+  // optimization: if Size >= 0 (signed), skip 1st check
+  // FIXME: add NSW/NUW here?  -- we dont care if the subtraction overflows
+  
+      //errs() << "Instruction: " << *Inst << "\n";
+      //errs() << "Offset: " << *Offset << "\n";
+      //errs() << "Size: " << *Size << "\n";
+      //errs() << "Needed Size: " << NeededSize << "\n";
+  if (SizeCI && !SizeCI->getValue().slt(0)) {
+    if (OffsetCI != NULL) {
+      uint64_t size = SizeCI->getZExtValue();
+      uint64_t offset = OffsetCI->getZExtValue();
+      
+      //errs() << "Constant Size: " << size << "\n";
+      //errs() << "Constant Offset: " << offset << "\n";
+
+      if ((size >= offset) && ((size - offset) >= NeededSize)) {
+        return check;
+      }
+    }
+  }
+  // Add check to work list
+  check = new BoundsCheck(Inst, Ptr, Size);   
+  return check;
+}
+
+bool BoundsChecking::LocalAnalysis(BasicBlock *blk) {
+  std::vector<BoundsCheck*> boundsChecks;
+  bool MadeChange = false;
+  IdentifyBoundsChecks(blk, &boundsChecks);
+
+  for (std::vector<BoundsCheck*>::iterator i = boundsChecks.begin(),
+        e = boundsChecks.end(); i != e; i++) {
+    BoundsCheck* check = *i;
+    check->print();
+  }
+  buildConstraintGraph(blk);
+  return MadeChange;
+}
 
 bool BoundsChecking::runOnFunction(Function &F) {
   TD = &getAnalysis<DataLayout>();
@@ -403,19 +471,14 @@ bool BoundsChecking::runOnFunction(Function &F) {
   ObjectSizeOffsetEvaluator TheObjSizeEval(TD, TLI, F.getContext());
   ObjSizeEval = &TheObjSizeEval;
 
-  std::vector<BasicBlock*> BBWorkList;
+  bool MadeChange = false;
   // Iterate over the Basic Blocks and perform local analysis
   for (Function::iterator i = F.begin(), e = F.end(); i != e; ++i) {
     errs() << "Basic block (name=" << i->getName() << ") has " << i->size() << "instructions.\n";
     BasicBlock *blk = &*i;
-    BBWorkList.push_back(blk);
+    MadeChange |= LocalAnalysis(blk);
   }
 
-  bool MadeChange = false;
-  for (std::vector<BasicBlock*>::iterator i = BBWorkList.begin(),
-       e = BBWorkList.end(); i != e; ++i) {
-    MadeChange |= LocalAnalysis(*i);
-  }
   return MadeChange;
 }
 

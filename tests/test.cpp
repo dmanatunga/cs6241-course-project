@@ -8,6 +8,7 @@ int main(int argc, char ** argv) {
   int i = -1 + 2;
   int j = arr[i];
   int *p = &j;
+  p = p + 1;
   count = count + 1;
   *p = -1;
   count = count + 2;
