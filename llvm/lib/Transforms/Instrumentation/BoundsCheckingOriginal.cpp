@@ -153,7 +153,7 @@ bool BoundsChecking::instrument(Value *Ptr, Value *InstVal) {
   //
   // optimization: if Size >= 0 (signed), skip 1st check
   // FIXME: add NSW/NUW here?  -- we dont care if the subtraction overflows
-  Builder->saveAndClearIP();
+  //Builder->saveAndClearIP();
   Value *ObjSize = Builder->CreateSub(Size, Offset);
   Value *Cmp2 = Builder->CreateICmpULT(Size, Offset);
   Value *Cmp3 = Builder->CreateICmpULT(ObjSize, NeededSizeVal);
