@@ -1,26 +1,38 @@
 
-
-
+// BoundsCheck Class
 class BoundsCheck
 {
   public:
     BoundsCheck(Instruction *inst, Value *ind, Value *ub_val);
     ~BoundsCheck();
     
+    Value*  getUpperBound();
+    Value*  getIndex();
+   
+
+    bool hasLowerBoundsCheck();
+    bool hasUpperBoundsCheck();
+    void deleteLowerBoundsCheck();
+    void deleteUpperBoundsCheck();
+    
+    Instruction* getInsertPoint();
+    void insertBefore(Instruction* I);
+
+    bool stillExists();
+    void print();
+    
+    void addLowerBoundsCheck();
+    void addUpperBoundsCheck();
+    
     uint64_t lowerBoundValue();
     uint64_t upperBoundValue();
-
-    bool insertLowerBoundsCheck();
-    void addLowerBoundsCheck();
-    void deleteLowerBoundsCheck();
-    bool insertUpperBoundsCheck();
-    void addUpperBoundsCheck();
-    void deleteUpperBoundsCheck();
-    void print();
   private:
     // Value associated with the check
     Instruction *inst;
+    Instruction *insertLoc;
+    bool moveIns;
     Value *index;
+    Value *offset;
     uint64_t lower_bound;
     bool lower_bound_static;
     uint64_t upper_bound;
@@ -31,12 +43,14 @@ class BoundsCheck
 };
 
 
-BoundsCheck::BoundsCheck(Instruction *I, Value *ind, Value *ub_val) 
+BoundsCheck::BoundsCheck(Instruction *I, Value *ind, Value* off, Value *ub_val) 
 {
   inst = I;
   index = ind;
   upper_bound_value = ub_val;
-
+  offset = off;
+  insertLoc = I;
+  moveIns = false;
   lower_bound = 0;
   lower_bound_static = true;
 
@@ -55,7 +69,29 @@ BoundsCheck::BoundsCheck(Instruction *I, Value *ind, Value *ub_val)
 
 BoundsCheck::~BoundsCheck() 
 {
-  
+}
+
+
+Value* BoundsCheck::getUpperBound() {
+  return upper_bound_value;
+}
+
+
+Value* BoundsCheck::getIndex() {
+  return index;
+}
+
+Instruction* BoundsCheck::getInsertPoint() {
+  return insertLoc;
+}
+
+void BoundsCheck::insertBefore(Instruction *inst) {
+  moveIns = insertLoc == inst;
+  insertLoc = inst;
+}
+
+bool BoundsCheck::stillExists() {
+  return insert_lower_bound || insert_upper_bound;
 }
 
 void BoundsCheck::print()
@@ -76,7 +112,7 @@ uint64_t BoundsCheck::upperBoundValue()
   return upper_bound;
 }
 
-bool BoundsCheck::insertLowerBoundsCheck() 
+bool BoundsCheck::hasLowerBoundsCheck() 
 {
   return insert_lower_bound;
 }
@@ -90,7 +126,7 @@ void BoundsCheck::deleteLowerBoundsCheck() {
 }
 
 
-bool BoundsCheck::insertUpperBoundsCheck() 
+bool BoundsCheck::hasUpperBoundsCheck() 
 {
   return insert_upper_bound;
 }

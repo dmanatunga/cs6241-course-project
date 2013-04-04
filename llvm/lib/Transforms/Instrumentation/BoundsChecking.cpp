@@ -28,6 +28,7 @@
 #include "llvm/Transforms/Instrumentation.h"
 using namespace llvm;
 #include "BoundsCheck.hpp"
+#include "ConstraintGraph.hpp"
 
 static cl::opt<bool> SingleTrapBB("bounds-checking-single-trap",
                                   cl::desc("Use one trap block per function"));
@@ -71,9 +72,12 @@ namespace {
     // Local Analysis Functions
     bool LocalAnalysis(BasicBlock *blk);
     void IdentifyBoundsChecks(BasicBlock *blk, std::vector<BoundsCheck*> *boundsChecks);
+    void EliminateBoundsChecks(std::vector<BoundsCheck*> *boundsChecks, ConstraintGraph *cg);
+    void eliminateForwards(BoundsCheck* check1, BoundsCheck* check2, ConstraintGraph *cg);
+    void eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2, ConstraintGraph *cg);
+    bool InsertChecks(std::vector<BoundsCheck*> *boundsCheck);
     BoundsCheck* createBoundsCheck(Instruction *Inst, Value *Ptr, Value *Val);
-    bool canDetermineCheckAtCompileTime(Value *Cmp = 0);
-    void buildConstraintGraph(BasicBlock *blk);
+    void buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg);
  };
 }
 
@@ -183,7 +187,7 @@ bool BoundsChecking::instrument(Value *Ptr, Value *InstVal) {
 
 
 
-void BoundsChecking::buildConstraintGraph(BasicBlock *blk) {
+void BoundsChecking::buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg) {
 
   std::vector<Instruction*> WorkList;
   // Iterate over instructions in the basic block and build the constraint graph
@@ -388,16 +392,6 @@ void BoundsChecking::IdentifyBoundsChecks(BasicBlock *blk, std::vector<BoundsChe
   }
 }
 
-/// If Cmp is non-null, perform a jump only if its value evaluates to true.
-bool BoundsChecking::canDetermineCheckAtCompileTime(Value *Cmp) {
-  // check if the comparison is always false
-  ConstantInt *C = dyn_cast_or_null<ConstantInt>(Cmp);
-  if (C && (!C->getZExtValue())) {
-      errs() << *C << "\n";
-      return true;
-  }
-  return false;
-}
 
 /// Ptr is the pointer that will be read/written, and InstVal is either the
 /// result from the load or the value being stored. It is used to determine the
@@ -443,8 +437,134 @@ BoundsCheck* BoundsChecking::createBoundsCheck(Instruction *Inst, Value *Ptr, Va
     }
   }
   // Add check to work list
-  check = new BoundsCheck(Inst, Ptr, Size);   
+  check = new BoundsCheck(Inst, Ptr, Offset, Size);   
   return check;
+}
+
+
+void BoundsChecking::eliminateForwards(BoundsCheck* check1, BoundsCheck* check2,
+                                       ConstraintGraph *cg) { 
+  Value *ub1 = check1->getUpperBound();
+  Value *ub2 = check2->getUpperBound();
+  Value *index1 = check2->getIndex();
+  Value *index2 = check2->getIndex();
+
+  ConstraintGraph::CompareEnum cmp1 = cg->compare(index1, index2);
+  if (check1->hasLowerBoundsCheck()) {
+    // If check1 lower bounds check is valid
+    switch (cmp1) {
+      case ConstraintGraph::LESS_THAN:
+      case ConstraintGraph::EQUALS:
+        // If index1 < index2, don't need 0 <= index2
+        check2->deleteLowerBoundsCheck();
+        break;
+      default:
+        // Unknown value for indiciesi
+        break;
+    }
+  }
+
+  if (check1->hasUpperBoundsCheck()) {
+    // If check 1 is upper bounds check valid
+    ConstraintGraph::CompareEnum cmp2 = cg->compare(ub1, ub2);
+    switch (cmp1) {
+      case ConstraintGraph::GREATER_THAN:
+      case ConstraintGraph::EQUALS:
+        if (cmp2 == ConstraintGraph::LESS_THAN || cmp2 == ConstraintGraph::EQUALS) {
+          // If index1 >= index2, and ub1 <= ub2, don't need index2 <= ub2
+          check2->deleteUpperBoundsCheck();
+        }
+        break;
+      default:
+        // Unknown indicies, or unknown sizes
+        break;
+    }
+  }
+}
+
+void BoundsChecking::eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2,
+                                        ConstraintGraph *cg) { 
+  Value *ub1 = check1->getUpperBound();
+  Value *ub2 = check2->getUpperBound();
+  Value *index1 = check2->getIndex();
+  Value *index2 = check2->getIndex();
+  
+  ConstraintGraph::CompareEnum cmp1 = cg->compare(index2, index1);
+  if (check2->hasLowerBoundsCheck()) {
+    // If check2 lower bounds check is valid
+    switch (cmp1) {
+      case ConstraintGraph::LESS_THAN:
+      case ConstraintGraph::EQUALS:
+        // If index2 < index1, don't need 0 <= index1
+        check1->deleteLowerBoundsCheck();
+        check2->insertBefore(check1->getInsertPoint());
+        break;
+      default:
+        // Unknown value for indicies
+        break;
+    }
+  }
+
+  if (check2->hasUpperBoundsCheck()) {
+    // If check 2 is upper bounds check valid
+    ConstraintGraph::CompareEnum cmp2 = cg->compare(ub2, ub1);
+    switch (cmp1) {
+      case ConstraintGraph::EQUALS:
+      case ConstraintGraph::GREATER_THAN:
+        if (cmp2 == ConstraintGraph::LESS_THAN || cmp2 == ConstraintGraph::EQUALS) {
+          // If index2 >= index1, and ub2 <= ub1, don't need index1 <= ub2
+          check1->deleteUpperBoundsCheck();
+          check2->insertBefore(check1->getInsertPoint());
+        }
+        break;
+      default:
+        // Unknown indicies, or unknown sizes
+        break;
+    }
+  }
+}
+
+void BoundsChecking::EliminateBoundsChecks(std::vector<BoundsCheck*> *boundsChecks, 
+                                           ConstraintGraph *cg) {
+  // Forward analysis to identify if higher occuring bounds check
+  // is stricter than lower occuring bounds check
+  for (unsigned int i = 0; i < boundsChecks->size(); i++) {
+    BoundsCheck *check = boundsChecks->at(i);
+
+    if (check->stillExists()) {
+      for (unsigned int j = i + 1; i < boundsChecks->size(); j++) {
+        BoundsCheck* tmp = boundsChecks->at(j);
+        if (tmp->stillExists()) {
+          eliminateForwards(check, tmp, cg);
+        }
+      }
+    }
+  }
+
+  // Backwards analysis to identify if lower occuring bounds check
+  // is stricter than higher occuring bounds check
+  for (int i = boundsChecks->size()-1; i >= 0; i--) {
+    BoundsCheck *check = boundsChecks->at(i);
+
+    if (check->stillExists()) {
+      for (int j = i - 1; j >= 0;  j--) {
+        BoundsCheck* tmp = boundsChecks->at(j);
+        if (tmp->stillExists()) {
+          eliminateBackwards(check, tmp, cg);
+        }
+      }
+    }
+  }
+}
+
+bool BoundsChecking::InsertChecks(std::vector<BoundsCheck*> *boundsChecks) {
+  bool MadeChange = false;
+  for (std::vector<BoundsCheck*>::iterator i = boundsChecks->begin(),
+            e = boundsChecks->end(); i != e; i++) {
+    
+    
+  }  
+  return MadeChange;
 }
 
 bool BoundsChecking::LocalAnalysis(BasicBlock *blk) {
@@ -452,12 +572,23 @@ bool BoundsChecking::LocalAnalysis(BasicBlock *blk) {
   bool MadeChange = false;
   IdentifyBoundsChecks(blk, &boundsChecks);
 
+  errs() << "===================================\n";
+  errs() << "Identified Bounds Checks\n";
   for (std::vector<BoundsCheck*>::iterator i = boundsChecks.begin(),
         e = boundsChecks.end(); i != e; i++) {
     BoundsCheck* check = *i;
     check->print();
   }
-  buildConstraintGraph(blk);
+  errs() << "===================================\n";
+
+  errs() << "===================================\n";
+  errs() << "Building Constraints Graph\n";
+  ConstraintGraph cg;
+  buildConstraintGraph(blk, &cg);
+  errs() << "===================================\n";
+  
+  //EliminateBoundsChecks(&boundsChecks, &cg);
+  MadeChange = InsertChecks(&boundsChecks);
   return MadeChange;
 }
 
@@ -471,7 +602,7 @@ bool BoundsChecking::runOnFunction(Function &F) {
   ObjectSizeOffsetEvaluator TheObjSizeEval(TD, TLI, F.getContext());
   ObjSizeEval = &TheObjSizeEval;
 
-  bool MadeChange = false;
+  bool MadeChange = true;
   // Iterate over the Basic Blocks and perform local analysis
   for (Function::iterator i = F.begin(), e = F.end(); i != e; ++i) {
     errs() << "Basic block (name=" << i->getName() << ") has " << i->size() << "instructions.\n";
@@ -485,3 +616,4 @@ bool BoundsChecking::runOnFunction(Function &F) {
 FunctionPass *llvm::createBoundsCheckingPass(unsigned Penalty) {
   return new BoundsChecking(Penalty);
 }
+
