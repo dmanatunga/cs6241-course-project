@@ -26,7 +26,9 @@
 #include "llvm/DataLayout.h"
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Transforms/Instrumentation.h"
+#include <queue>
 using namespace llvm;
+#define DEBUG_LOCAL 1
 #include "BoundsCheck.hpp"
 #include "ConstraintGraph.hpp"
 
@@ -55,6 +57,7 @@ namespace {
     }
 
   private:
+    int numChecksAdded;
     const DataLayout *TD;
     const TargetLibraryInfo *TLI;
     ObjectSizeOffsetEvaluator *ObjSizeEval;
@@ -75,6 +78,7 @@ namespace {
     void EliminateBoundsChecks(std::vector<BoundsCheck*> *boundsChecks, ConstraintGraph *cg);
     void eliminateForwards(BoundsCheck* check1, BoundsCheck* check2, ConstraintGraph *cg);
     void eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2, ConstraintGraph *cg);
+    bool InsertCheck(BoundsCheck* check);
     bool InsertChecks(std::vector<BoundsCheck*> *boundsCheck);
     BoundsCheck* createBoundsCheck(Instruction *Inst, Value *Ptr, Value *Val);
     void buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg);
@@ -112,6 +116,9 @@ BasicBlock *BoundsChecking::getTrapBB() {
 /// emitBranchToTrap - emit a branch instruction to a trap block.
 /// If Cmp is non-null, perform a jump only if its value evaluates to true.
 void BoundsChecking::emitBranchToTrap(Value *Cmp) {
+#if DEBUG_LOCAL
+  errs() << "Emitting Branch Instruction\n";
+#endif
   // check if the comparison is always false
   ConstantInt *C = dyn_cast_or_null<ConstantInt>(Cmp);
   if (C) {
@@ -126,7 +133,6 @@ void BoundsChecking::emitBranchToTrap(Value *Cmp) {
   BasicBlock *OldBB = Inst->getParent();
   BasicBlock *Cont = OldBB->splitBasicBlock(Inst);
   OldBB->getTerminator()->eraseFromParent();
-
   if (Cmp)
     BranchInst::Create(getTrapBB(), Cont, Cmp, OldBB);
   else
@@ -193,57 +199,88 @@ void BoundsChecking::buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg) 
   // Iterate over instructions in the basic block and build the constraint graph
   for (BasicBlock::iterator i = blk->begin(), e = blk->end(); i != e; ++i) {
     Instruction *I = &*i;
+  #if DEBUG_LOCAL
     errs() << "===========================================\n"; 
-    if (isa<CallInst>(I)) {
+  #endif
+    if (isa<AllocaInst>(I)) {      
+    #if DEBUG_LOCAL
+      errs() << "Allocate Instruction: " << *I << "\n";
+    #endif
+      cg->addMemoryNode(I);
+    } else if (isa<CallInst>(I)) {
+    #if DEBUG_LOCAL
+      errs() << "Function Call: " << *I << "\n";
+    #endif
       // Function call instruction, we must kill all variables
-      errs() << "Function Call: " << *I << "\n"; 
+      cg->killMemoryLocations();
+      //errs() << "Function Call: " << *I << "\n"; 
     } else if (I->isCast()) {
-      // If cast, basically set output equal to input
+    #if DEBUG_LOCAL
       errs() << "Cast Operator: " << *I << "\n";
-      Value *op1 = I->getOperand(0);
-      errs() << "Casting: " << *op1 << "\n";
+    #endif
+      // If cast, basically set output equal to input
+      Value *op2 = I->getOperand(0);
+      cg->addCastEdge(op2, I);
+      //errs() << "Cast Operator: " << *I << "\n";
+      //errs() << "Casting: " << *op1 << "\n";
     } else if (isa<GetElementPtrInst>(I)) {
-      errs() << "Get Element Pointer: " << *I << "\n";
+    #if DEBUG_LOCAL
+      errs() << "GEP: " << *I << "\n";
+    #endif
       Value *index = I->getOperand(I->getNumOperands()-1);
-      errs() << "Index: " << *index << "\n";
+      cg->addGEPEdge(index, I);
+      //errs() << "Get Element Pointer: " << *I << "\n";
+      //errs() << "Index: " << *index << "\n";
     } else if (isa<LoadInst>(I)) {
-      // If a load, associate register with memory identifier
+    #if DEBUG_LOCAL
       errs() << "Load Operator: " << *I << "\n";
+    #endif
+      // If a load, associate register with memory identifier
       LoadInst *LI = dyn_cast<LoadInst>(I);
       Value *op1 = LI->getPointerOperand();
-      errs() << "Loading From: " << *op1 << "\n";
-      errs() << "Loading To: " << *I << "\n";
+      cg->addLoadEdge(op1, I);
+      //errs() << "Loading From: " << *op1 << "\n";
+      //errs() << "Loading To: " << *I << "\n";
     } else if (isa<StoreInst>(I)) {
-      // If a store instruction, we need to set that memory location to value in graph
+    #if DEBUG_LOCAL
       errs() << "Store Operator: " << *I << "\n";
+    #endif
+      // If a store instruction, we need to set that memory location to value in graph
       StoreInst *SI = dyn_cast<StoreInst>(I);
       Value *to = SI->getPointerOperand();
       Value *from = SI->getValueOperand();
+      Type* T = to->getType();
+      bool isPointer = T->isPointerTy() && T->getContainedType(0)->isPointerTy();
+      cg->addStoreEdge(from, to, I);
+      if (isPointer) {
+      #if DEBUG_LOCAL
+        errs() << "Storing From Pointer\n";
+      #endif
+        // If store to location was a pointer, then we must kill all memory locations
+        cg->killMemoryLocations();
+      } 
+      /**
       ConstantInt *ConstVal = dyn_cast<ConstantInt>(from);
       if (ConstVal != NULL) {
         errs() << "Storing Value: " << ConstVal->getSExtValue() << "\n";
       } else {
         errs() << "Storing From: " << *from << "\n";
       }
-    
-       
-      //AllocaInst *allocInst = dyn_cast<AllocaInst>(to);
-      //GlobalValue *global = dyn_cast<GlobalValue>(to);
-      //bool isPointer = (allocInst == NULL && global == NULL);
       
-      Type* T = to->getType();
-      bool isPointer = T->isPointerTy() && T->getContainedType(0)->isPointerTy();
       if (isPointer) {
         errs() << "Storing To Pointer Location: " << *to << "\n";
       } else {
         errs() << "Storing To: " << *to << "\n";
       }
+      */
     } else if (I->isBinaryOp()) {
       unsigned opcode = I->getOpcode();
       if (opcode == Instruction::Add) {
           int64_t val = 0;
           Value *var = NULL;
+        #if DEBUG_LOCAL
           errs() << "Add Operator: " << *I << "\n";
+        #endif  
           Value *op1 = I->getOperand(0);
           Value *op2 = I->getOperand(1);
 
@@ -253,23 +290,29 @@ void BoundsChecking::buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg) 
           if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
             // We know both operands so can just create blank node with value
             val = ConstVal1->getSExtValue() + ConstVal2->getSExtValue();
+            cg->addConstantNode(I, val);
           } else if (ConstVal1 != NULL) {
             val = ConstVal1->getSExtValue();
             var = op2;
-            errs() << *var << "\n";
-            errs() << "Constant: " << val << "\n";
+            cg->addAddEdge(var, I, val);
+            //errs() << *var << "\n";
+            //errs() << "Constant: " << val << "\n";
           } else if (ConstVal2 != NULL) {
             var = op1;
             val = ConstVal2->getSExtValue();
-            errs() << *var << "\n";
-            errs() << "Constant: " << val << "\n";
+            cg->addAddEdge(var, I, val);
+            //errs() << *var << "\n";
+            //errs() << "Constant: " << val << "\n";
           } else {
             // Both operands are variables, so we must just create blank node
+            cg->addNode(I);
           }
       } else if (opcode == Instruction::Sub) {
           int64_t val = 0;
           Value *var = NULL;
+        #if DEBUG_LOCAL
           errs() << "Subtraction Operator: " << *I << "\n";
+        #endif
           Value *op1 = I->getOperand(0);
           Value *op2 = I->getOperand(1);
 
@@ -279,20 +322,26 @@ void BoundsChecking::buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg) 
           if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
             // We know both operands so can just create blank node with value
             val = ConstVal1->getSExtValue() - ConstVal2->getSExtValue();
+            cg->addConstantNode(I, val);
           } else if (ConstVal1 != NULL) {
             // Second operand is variable so we can't determine much about operation
+            cg->addNode(I);
           } else if (ConstVal2 != NULL) {
             var = op1;
-            val = -ConstVal2->getSExtValue();
-            errs() << *var << "\n";
-            errs() << "Constant: " << val << "\n";
+            val = ConstVal2->getSExtValue();
+            cg->addSubEdge(var, I, val);
+            //errs() << *var << "\n";
+            //errs() << "Constant: " << val << "\n";
           } else {
             // Both operands are variables, so we must just create blank node
+            cg->addNode(I);
           }
       } else if (opcode == Instruction::Mul) {
           int64_t val = 0;
           Value *var = NULL;
+        #if DEBUG_LOCAL
           errs() << "Multiply Operator: " << *I << "\n";
+        #endif
           Value *op1 = I->getOperand(0);
           Value *op2 = I->getOperand(1);
 
@@ -302,23 +351,29 @@ void BoundsChecking::buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg) 
           if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
             // We know both operands so can just create blank node with value
             val = ConstVal1->getSExtValue()*ConstVal2->getSExtValue();
+            cg->addConstantNode(I, val);
           } else if (ConstVal1 != NULL) {
             val = ConstVal1->getSExtValue();
             var = op2;
-            errs() << *var << "\n";
-            errs() << "Constant: " << val << "\n";
+            cg->addMulEdge(var, I, val);
+            //errs() << *var << "\n";
+            //errs() << "Constant: " << val << "\n";
           } else if (ConstVal2 != NULL) {
             var = op1;
             val = ConstVal2->getSExtValue();
-            errs() << *var << "\n";
-            errs() << "Constant: " << val << "\n";
+            cg->addMulEdge(var, I, val);
+            //errs() << *var << "\n";
+            //errs() << "Constant: " << val << "\n";
           } else {
             // Both operands are variables, so we must just create blank node
+            cg->addNode(I);
           }
       } else if (opcode == Instruction::UDiv) {
           int64_t val = 0;
           Value *var = NULL;
+        #if DEBUG_LOCAL 
           errs() << "Unsigned Division Operator: " << *I << "\n";
+        #endif
           Value *op1 = I->getOperand(0);
           Value *op2 = I->getOperand(1);
 
@@ -328,20 +383,26 @@ void BoundsChecking::buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg) 
           if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
             // We know both operands so can just create blank node with value
             val = (int64_t)(ConstVal1->getZExtValue()/ConstVal2->getZExtValue());
+            cg->addConstantNode(I, val);
           } else if (ConstVal1 != NULL) {
             // Second operand is variable so we can't determine much about operation
+            cg->addNode(I);
           } else if (ConstVal2 != NULL) {
             var = op1;
             val = (int64_t)ConstVal2->getZExtValue();
+            cg->addDivEdge(var, I, val);
             errs() << *var << "\n";
             errs() << "Constant: " << val << "\n";
           } else {
             // Both operands are variables, so we must just create blank node
+            cg->addNode(I);
           }
       } else if (opcode == Instruction::SDiv) {
           int64_t val = 0;
           Value *var = NULL;
+        #if DEBUG_LOCAL  
           errs() << "Signed Division Operator: " << *I << "\n";
+        #endif
           Value *op1 = I->getOperand(0);
           Value *op2 = I->getOperand(1);
 
@@ -351,23 +412,30 @@ void BoundsChecking::buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg) 
           if ((ConstVal1 != NULL) && (ConstVal2 !=NULL)) {
             // We know both operands so can just create blank node with value
             val = ConstVal1->getSExtValue() + ConstVal2->getSExtValue();
+            cg->addConstantNode(I, val);
           } else if (ConstVal1 != NULL) {
             // Second operand is variable so we can't determine much about operation
+            cg->addNode(I);
           } else if (ConstVal2 != NULL) {
             var = op1;
             val = ConstVal2->getSExtValue();
-            
+            if (val > 0) { 
+              cg->addDivEdge(var, I, val);
+              //errs() << *var << "\n";
+              //errs() << "Constant: " << val << "\n";
+            } else {
+              cg->addNode(I);
+            }
           } else {
             // Both operands are variables, so we must just create blank node
+            cg->addNode(I);
           }
-          errs() << *var << "\n";
-          errs() << "Constant: " << val << "\n";
       } else {
-        errs() << "Handle opcode: " << I->getOpcodeName() << "?\n";
+        errs() << "Handle opcode: " << I->getOpcodeName() << "?: " << *I << "\n";
       }
     } else {
-      errs() << "Handle opcode: " << I->getOpcodeName() << "?\n";
-      errs() << *I << "\n";
+      cg->addNode(I);
+      errs() << "Handle opcode: " << I->getOpcodeName() << "?: " << *I << "\n";
     }
   }
 }
@@ -423,7 +491,7 @@ BoundsCheck* BoundsChecking::createBoundsCheck(Instruction *Inst, Value *Ptr, Va
       //errs() << "Offset: " << *Offset << "\n";
       //errs() << "Size: " << *Size << "\n";
       //errs() << "Needed Size: " << NeededSize << "\n";
-  if (SizeCI && !SizeCI->getValue().slt(0)) {
+  if (SizeCI) {
     if (OffsetCI != NULL) {
       uint64_t size = SizeCI->getZExtValue();
       uint64_t offset = OffsetCI->getZExtValue();
@@ -435,9 +503,48 @@ BoundsCheck* BoundsChecking::createBoundsCheck(Instruction *Inst, Value *Ptr, Va
         return check;
       }
     }
+  } else {
+    BinaryOperator* SizeInst = dyn_cast<BinaryOperator>(Size);
+    if ((SizeInst != NULL) && (SizeInst->getOpcode() == Instruction::Mul)) {
+      Size = SizeInst->getOperand(1);
+      SizeInst->eraseFromParent();
+    }
   }
+
+  Value* Index = Ptr;
+  GetElementPtrInst* gep = dyn_cast<GetElementPtrInst>(Ptr);
+  if (gep != NULL) {
+      Index = gep->getOperand(gep->getNumOperands()-1);
+  }
+
+  if (OffsetCI == NULL) {
+    Instruction *OffsetInst = dyn_cast<Instruction>(Offset);
+    std::queue<Instruction*> worklist;
+    bool addOperands = true;
+    errs() << *Offset << "\n";
+    worklist.push(OffsetInst);
+    while (!worklist.empty()) {
+      Instruction *tmp = worklist.front();
+      worklist.pop();
+      if (addOperands){
+        for (unsigned int i = 0; i < tmp->getNumOperands(); i++) {
+          OffsetInst = dyn_cast<Instruction>(tmp->getOperand(i));
+          if (OffsetInst != NULL) {
+            if (OffsetInst == Index) {
+              addOperands = false;
+              break;
+            } else {
+              worklist.push(OffsetInst);
+            }
+          } 
+        }
+      }
+      tmp->eraseFromParent();
+    }
+  }
+
   // Add check to work list
-  check = new BoundsCheck(Inst, Ptr, Offset, Size);   
+  check = new BoundsCheck(Inst, Ptr, Index, Index, Size);   
   return check;
 }
 
@@ -446,36 +553,67 @@ void BoundsChecking::eliminateForwards(BoundsCheck* check1, BoundsCheck* check2,
                                        ConstraintGraph *cg) { 
   Value *ub1 = check1->getUpperBound();
   Value *ub2 = check2->getUpperBound();
-  Value *index1 = check2->getIndex();
+  Value *index1 = check1->getIndex();
   Value *index2 = check2->getIndex();
 
   ConstraintGraph::CompareEnum cmp1 = cg->compare(index1, index2);
-  if (check1->hasLowerBoundsCheck()) {
+  if (check1->hasLowerBoundsCheck() && check2->hasUpperBoundsCheck()) {
+  #if DEBUG_LOCAL
+    errs() << "Checking Lower Bound Subsuming...\n";
+  #endif
     // If check1 lower bounds check is valid
     switch (cmp1) {
       case ConstraintGraph::LESS_THAN:
       case ConstraintGraph::EQUALS:
-        // If index1 < index2, don't need 0 <= index2
+      #if DEBUG_LOCAL
+        errs() << "Deleting Lower Bounds Check for " << *index2 << "\n";
+      #endif
+        // If index1 <= index2, don't need 0 <= index2
         check2->deleteLowerBoundsCheck();
         break;
+      #if DEBUG_LOCAL
+      case ConstraintGraph::GREATER_THAN:
+        break;
+      #endif
       default:
+      #if DEBUG_LOCAL
+        errs() << "Unknown comparison between " << *index1 << " and " << *index2 <<"\n";
+      #endif
         // Unknown value for indiciesi
         break;
     }
   }
 
-  if (check1->hasUpperBoundsCheck()) {
+  if (check1->hasUpperBoundsCheck() && check2->hasUpperBoundsCheck()) {
+  #if DEBUG_LOCAL
+    errs() << "Checking Upper Bound Subsuming...\n";
+  #endif
     // If check 1 is upper bounds check valid
     ConstraintGraph::CompareEnum cmp2 = cg->compare(ub1, ub2);
     switch (cmp1) {
-      case ConstraintGraph::GREATER_THAN:
+      #if DEBUG_LOCAL
+      case ConstraintGraph::LESS_THAN:
+        break;
+      #endif
       case ConstraintGraph::EQUALS:
+      case ConstraintGraph::GREATER_THAN:
         if (cmp2 == ConstraintGraph::LESS_THAN || cmp2 == ConstraintGraph::EQUALS) {
+        #if DEBUG_LOCAL
+          errs() << "Deleting Upper Bounds Check for " << *index2 << "\n";
+        #endif
           // If index1 >= index2, and ub1 <= ub2, don't need index2 <= ub2
           check2->deleteUpperBoundsCheck();
         }
+        #if DEBUG_LOCAL
+         else if (cmp2 == ConstraintGraph::UNKNOWN) {
+          errs() << "Unknown comparison between " << *ub1 << " and " << *ub2 <<"\n";
+         }
+        #endif
         break;
       default:
+      #if DEBUG_LOCAL
+        errs() << "Unknown comparison between " << *index1 << " and " << *index2 <<"\n";
+      #endif
         // Unknown indicies, or unknown sizes
         break;
     }
@@ -486,38 +624,83 @@ void BoundsChecking::eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2
                                         ConstraintGraph *cg) { 
   Value *ub1 = check1->getUpperBound();
   Value *ub2 = check2->getUpperBound();
-  Value *index1 = check2->getIndex();
+  Value *index1 = check1->getIndex();
   Value *index2 = check2->getIndex();
   
-  ConstraintGraph::CompareEnum cmp1 = cg->compare(index2, index1);
-  if (check2->hasLowerBoundsCheck()) {
+  // Compare index 1 to index 2
+  ConstraintGraph::CompareEnum cmp1 = cg->compare(index1, index2);
+  if (check2->hasLowerBoundsCheck() && check1->hasLowerBoundsCheck()) {
+  #if DEBUG_LOCAL
+    errs() << "Checking Lower Bound Subsuming...\n";
+  #endif
     // If check2 lower bounds check is valid
     switch (cmp1) {
+      #if DEBUG_LOCAL
       case ConstraintGraph::LESS_THAN:
+        break;
+      #endif
       case ConstraintGraph::EQUALS:
-        // If index2 < index1, don't need 0 <= index1
-        check1->deleteLowerBoundsCheck();
-        check2->insertBefore(check1->getInsertPoint());
+      case ConstraintGraph::GREATER_THAN:
+      #if DEBUG_LOCAL
+        errs() << "Deleting Lower Bounds Check for " << *index1 << "\n";
+      #endif
+        // If index1 >= index2, don't need 0 <= index1
+        if (cg->findDependencyPath(index1, index2, &(check2->dependentInsts))) {
+          check1->deleteLowerBoundsCheck();
+          check2->insertBefore(dyn_cast<Instruction>(check1->getIndex()));
+        }
+      #if DEBUG_LOCAL
+        else {
+          errs() << "Could not move " << *index2 << " to " << *index1 << "\n";
+        }
+      #endif
         break;
       default:
+      #if DEBUG_LOCAL
+        errs() << "Unknown comparison between " << *index1 << " and " << *index2 <<"\n";
+      #endif
         // Unknown value for indicies
         break;
     }
   }
 
-  if (check2->hasUpperBoundsCheck()) {
+  if (check2->hasUpperBoundsCheck() && check1->hasUpperBoundsCheck()) {
+  #if DEBUG_LOCAL
+    errs() << "Checking Upper Bound Subsuming...\n";
+  #endif
     // If check 2 is upper bounds check valid
-    ConstraintGraph::CompareEnum cmp2 = cg->compare(ub2, ub1);
+    ConstraintGraph::CompareEnum cmp2 = cg->compare(ub1, ub2);
     switch (cmp1) {
+      case ConstraintGraph::LESS_THAN:
       case ConstraintGraph::EQUALS:
-      case ConstraintGraph::GREATER_THAN:
-        if (cmp2 == ConstraintGraph::LESS_THAN || cmp2 == ConstraintGraph::EQUALS) {
-          // If index2 >= index1, and ub2 <= ub1, don't need index1 <= ub2
-          check1->deleteUpperBoundsCheck();
-          check2->insertBefore(check1->getInsertPoint());
+        if (cmp2 == ConstraintGraph::GREATER_THAN || cmp2 == ConstraintGraph::EQUALS) {
+        #if DEBUG_LOCAL
+          errs() << "Deleting Upper Bounds Check for " << *index1 << "\n";
+        #endif
+          // If index1 <= index2, and ub2 <= ub1, don't need index1 <= ub1
+          if (cg->findDependencyPath(index1, index2, &(check2->dependentInsts))) {
+            check1->deleteUpperBoundsCheck();
+            check2->insertBefore(dyn_cast<Instruction>(check1->getIndex()));
+          }
+        #if DEBUG_LOCAL
+          else {
+            errs() << "Could not move " << *index2 << " to " << *index1 << "\n";
+          }
+        #endif
+        } 
+      #if DEBUG_LOCAL
+        else if (cmp2 == ConstraintGraph::UNKNOWN) {
+          errs() << "Unknown comparison between " << *ub1 << " and " << *ub2 <<"\n";
         }
+      #endif
         break;
+      #if DEBUG_LOCAL
+      case ConstraintGraph::GREATER_THAN:
+      #endif
       default:
+      #if DEBUG_LOCAL
+        errs() << "Unknown comparison between " << *index1 << " and " << *index2 <<"\n";
+      #endif
         // Unknown indicies, or unknown sizes
         break;
     }
@@ -526,13 +709,16 @@ void BoundsChecking::eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2
 
 void BoundsChecking::EliminateBoundsChecks(std::vector<BoundsCheck*> *boundsChecks, 
                                            ConstraintGraph *cg) {
+#if DEBUG_LOCAL
+  errs() << "Forward Elimination...\n";
+#endif
   // Forward analysis to identify if higher occuring bounds check
   // is stricter than lower occuring bounds check
-  for (unsigned int i = 0; i < boundsChecks->size(); i++) {
+  for (int i = 0; i < ((int)boundsChecks->size())-1; i++) {
     BoundsCheck *check = boundsChecks->at(i);
 
     if (check->stillExists()) {
-      for (unsigned int j = i + 1; i < boundsChecks->size(); j++) {
+      for (unsigned int j = i + 1; j < boundsChecks->size(); j++) {
         BoundsCheck* tmp = boundsChecks->at(j);
         if (tmp->stillExists()) {
           eliminateForwards(check, tmp, cg);
@@ -541,27 +727,83 @@ void BoundsChecking::EliminateBoundsChecks(std::vector<BoundsCheck*> *boundsChec
     }
   }
 
+
+#if DEBUG_LOCAL
+  errs() << "Backwards Elimination...\n";
+#endif
   // Backwards analysis to identify if lower occuring bounds check
   // is stricter than higher occuring bounds check
-  for (int i = boundsChecks->size()-1; i >= 0; i--) {
+  for (int i = boundsChecks->size()-1; i >= 1; i--) {
     BoundsCheck *check = boundsChecks->at(i);
 
     if (check->stillExists()) {
       for (int j = i - 1; j >= 0;  j--) {
         BoundsCheck* tmp = boundsChecks->at(j);
         if (tmp->stillExists()) {
-          eliminateBackwards(check, tmp, cg);
+          eliminateBackwards(tmp, check, cg);
         }
       }
     }
   }
 }
 
+bool BoundsChecking::InsertCheck(BoundsCheck* check) {
+  if (!check->stillExists())
+    return false;
+ 
+#if DEBUG_LOCAL
+  errs() << "Adding Bounds Check:\n";
+  check->print();
+#endif
+  Inst = check->getInstruction(); 
+  Value *Size = check->getUpperBound();
+  Value *Index = check->getIndex();
+  if (check->moveCheck()) {
+    // Propogate the instructions to their new location
+    Instruction *insertPoint = check->getInsertPoint();
+    #if DEBUG_LOCAL
+      errs() << "Inserting Instructions at: " <<  *insertPoint << "\n";
+    #endif
+    for (std::vector<Instruction*>::iterator i = check->dependentInsts.begin(),
+             e = check->dependentInsts.end(); i != e; i++) {
+      Instruction *inst = *i;
+    #if DEBUG_LOCAL
+      errs() << "Moving instruction: " << *inst << " before " << *insertPoint << "\n";
+    #endif
+      inst->moveBefore(insertPoint);
+      insertPoint = inst;
+    }
+  }
+
+  
+  Builder->SetInsertPoint(check->getInsertPoint());
+  Value *llvmCheck = NULL;
+  if (check->hasUpperBoundsCheck()) {
+    llvmCheck = Builder->CreateICmpSGE(Size, Index);
+    numChecksAdded++;
+  } 
+
+  if (check->hasLowerBoundsCheck()) {
+    Type *IntTy = TD->getIntPtrType(check->getPointer()->getType());
+    numChecksAdded++;
+    Value *lowerCheck = Builder->CreateICmpSLT(Index, ConstantInt::get(IntTy, 0));
+    if (llvmCheck != NULL) {
+      llvmCheck = Builder->CreateOr(lowerCheck, llvmCheck);
+    } else {
+      llvmCheck = lowerCheck;
+    }
+  }
+
+  emitBranchToTrap(llvmCheck);
+  return true;
+}
+
 bool BoundsChecking::InsertChecks(std::vector<BoundsCheck*> *boundsChecks) {
   bool MadeChange = false;
   for (std::vector<BoundsCheck*>::iterator i = boundsChecks->begin(),
             e = boundsChecks->end(); i != e; i++) {
-    
+    MadeChange |= InsertCheck(*i);
+
     
   }  
   return MadeChange;
@@ -569,9 +811,10 @@ bool BoundsChecking::InsertChecks(std::vector<BoundsCheck*> *boundsChecks) {
 
 bool BoundsChecking::LocalAnalysis(BasicBlock *blk) {
   std::vector<BoundsCheck*> boundsChecks;
-  bool MadeChange = false;
+  ConstraintGraph cg;
+  bool MadeChange = true;
+  
   IdentifyBoundsChecks(blk, &boundsChecks);
-
   errs() << "===================================\n";
   errs() << "Identified Bounds Checks\n";
   for (std::vector<BoundsCheck*>::iterator i = boundsChecks.begin(),
@@ -583,12 +826,29 @@ bool BoundsChecking::LocalAnalysis(BasicBlock *blk) {
 
   errs() << "===================================\n";
   errs() << "Building Constraints Graph\n";
-  ConstraintGraph cg;
   buildConstraintGraph(blk, &cg);
+#if DEBUG_LOCAL  
+  cg.print();
+#endif
+  errs() << "===================================\n";
+
+  errs() << "===================================\n";
+  errs() << "Eliminating Bounds Checks\n";
+  EliminateBoundsChecks(&boundsChecks, &cg);
   errs() << "===================================\n";
   
-  //EliminateBoundsChecks(&boundsChecks, &cg);
+  errs() << "After Elimination Bounds Checks\n";
+  for (std::vector<BoundsCheck*>::iterator i = boundsChecks.begin(),
+        e = boundsChecks.end(); i != e; i++) {
+    BoundsCheck* check = *i;
+    check->print();
+  }
+  errs() << "===================================\n";
+  
+  errs() << "Insert Bounds Checks\n";
   MadeChange = InsertChecks(&boundsChecks);
+  errs() << "Added " << numChecksAdded << "\n";
+  errs() << "===================================\n";
   return MadeChange;
 }
 
@@ -601,15 +861,26 @@ bool BoundsChecking::runOnFunction(Function &F) {
   Builder = &TheBuilder;
   ObjectSizeOffsetEvaluator TheObjSizeEval(TD, TLI, F.getContext());
   ObjSizeEval = &TheObjSizeEval;
-
+  
+  numChecksAdded = 0;
   bool MadeChange = true;
+  std::vector<BasicBlock*> worklist;
   // Iterate over the Basic Blocks and perform local analysis
   for (Function::iterator i = F.begin(), e = F.end(); i != e; ++i) {
-    errs() << "Basic block (name=" << i->getName() << ") has " << i->size() << "instructions.\n";
-    BasicBlock *blk = &*i;
-    MadeChange |= LocalAnalysis(blk);
+    errs() << "Basic block (name=" << i->getName() << ") has " << i->size() << " instructions.\n";
+    worklist.push_back(&*i);
   }
 
+  for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); 
+              i != e; i++) {
+    MadeChange |= LocalAnalysis(*i);
+  }
+#if DEBUG_LOCAL
+  for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
+    Instruction *I = &*i;
+    errs() << *I << "\n";
+  }
+#endif
   return MadeChange;
 }
 

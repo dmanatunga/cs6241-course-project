@@ -3,11 +3,14 @@
 class BoundsCheck
 {
   public:
-    BoundsCheck(Instruction *inst, Value *ind, Value *ub_val);
+    BoundsCheck(Instruction *inst, Value *ptr, Value *ind, Value* off, Value *ub_val);
     ~BoundsCheck();
     
+
+    Value*  getPointer();
     Value*  getUpperBound();
     Value*  getIndex();
+    Value*  getOffset();
    
 
     bool hasLowerBoundsCheck();
@@ -19,20 +22,26 @@ class BoundsCheck
     void insertBefore(Instruction* I);
 
     bool stillExists();
+    bool moveCheck();
     void print();
     
     void addLowerBoundsCheck();
     void addUpperBoundsCheck();
-    
+    Instruction* getInstruction();
+
     uint64_t lowerBoundValue();
     uint64_t upperBoundValue();
+    
+    std::vector<Instruction*> dependentInsts;
   private:
     // Value associated with the check
+    Value *pointer;
     Instruction *inst;
     Instruction *insertLoc;
-    bool moveIns;
+    bool move_check;
     Value *index;
     Value *offset;
+
     uint64_t lower_bound;
     bool lower_bound_static;
     uint64_t upper_bound;
@@ -43,14 +52,15 @@ class BoundsCheck
 };
 
 
-BoundsCheck::BoundsCheck(Instruction *I, Value *ind, Value* off, Value *ub_val) 
+BoundsCheck::BoundsCheck(Instruction *I, Value *ptr, Value *ind, Value* off, Value *ub_val) 
 {
+  pointer = ptr;
   inst = I;
   index = ind;
   upper_bound_value = ub_val;
   offset = off;
   insertLoc = I;
-  moveIns = false;
+  move_check = false;
   lower_bound = 0;
   lower_bound_static = true;
 
@@ -64,14 +74,16 @@ BoundsCheck::BoundsCheck(Instruction *I, Value *ind, Value* off, Value *ub_val)
   
   
   insert_lower_bound = true;
-  insert_upper_bound = false;
+  insert_upper_bound = true;
 }
 
 BoundsCheck::~BoundsCheck() 
 {
 }
 
-
+Instruction* BoundsCheck::getInstruction() {
+  return inst;
+}
 Value* BoundsCheck::getUpperBound() {
   return upper_bound_value;
 }
@@ -81,13 +93,26 @@ Value* BoundsCheck::getIndex() {
   return index;
 }
 
+Value* BoundsCheck::getOffset() {
+  return offset;
+}
+
+Value* BoundsCheck::getPointer() {
+  return pointer;
+}
+
 Instruction* BoundsCheck::getInsertPoint() {
   return insertLoc;
 }
 
+
 void BoundsCheck::insertBefore(Instruction *inst) {
-  moveIns = insertLoc == inst;
+  move_check = insertLoc != inst;
   insertLoc = inst;
+}
+
+bool BoundsCheck::moveCheck() {
+  return move_check;
 }
 
 bool BoundsCheck::stillExists() {
@@ -98,10 +123,22 @@ void BoundsCheck::print()
 {
   errs() << "===========================\n";
   errs() << "Instruction: " << *inst << "\n";
-  errs() << "Lower Bound: " << lower_bound << "\n";
-  errs() << "Upper Bound: " << *upper_bound_value << "\n";
+  if (insert_lower_bound) {
+    errs() << "Lower Bound Check: " << lower_bound << "\n";
+  } else {
+    errs() << "Lower Bound Check (DELETED): " << lower_bound << "\n";
+  }
+
+  if (insert_upper_bound) {
+    errs() << "Upper Bound Check: " << *upper_bound_value << "\n";
+  } else {
+    errs() << "Upper Bound Check (DELETED): " << *upper_bound_value << "\n";
+  }
   errs() << "Index: " << *index << "\n";
+  errs() << "Moving Check :" << (move_check ? "Yes": "No") << "\n";
+  errs() << "Insert Point: " << *insertLoc << "\n";
 }
+
 uint64_t BoundsCheck::lowerBoundValue() 
 {
   return lower_bound;
