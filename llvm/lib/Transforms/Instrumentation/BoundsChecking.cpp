@@ -778,18 +778,24 @@ bool BoundsChecking::InsertCheck(BoundsCheck* check) {
   } 
 
   if (check->hasLowerBoundsCheck()) {
-    Type *IntTy = Index->getType();
+    Type *T = Index->getType();
     numChecksAdded++;
-    Value *lowerCheck = Builder->CreateICmpSLT(Index, ConstantInt::get(IntTy, 0));
-    if (llvmCheck != NULL) {
-      llvmCheck = Builder->CreateOr(lowerCheck, llvmCheck);
-    } else {
-      llvmCheck = lowerCheck;
+    bool isPointer = T->isPointerTy() && T->getContainedType(0)->isPointerTy();
+    if (!isPointer) {
+      Value *lowerCheck = Builder->CreateICmpSLT(Index, ConstantInt::get(IntTy, T));
+      if (llvmCheck != NULL) {
+        llvmCheck = Builder->CreateOr(lowerCheck, llvmCheck);
+      } else {
+        llvmCheck = lowerCheck;
+      }
     }
   }
 
-  emitBranchToTrap(llvmCheck);
-  return true;
+  if (llvmCheck != NULL) {
+    emitBranchToTrap(llvmCheck);
+    return true;
+  }
+  return false;
 }
 
 bool BoundsChecking::InsertChecks(std::vector<BoundsCheck*> *boundsChecks) {
