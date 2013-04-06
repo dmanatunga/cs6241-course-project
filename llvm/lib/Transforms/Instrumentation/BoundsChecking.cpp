@@ -58,7 +58,7 @@ namespace {
     }
 
   private:
-    int numChecksAdded;
+    int numChecksAdded = 0;
     const DataLayout *TD;
     const TargetLibraryInfo *TLI;
     ObjectSizeOffsetEvaluator *ObjSizeEval;
@@ -952,7 +952,6 @@ bool BoundsChecking::runOnFunction(Function &F) {
   ObjectSizeOffsetEvaluator TheObjSizeEval(TD, TLI, F.getContext());
   ObjSizeEval = &TheObjSizeEval;
   
-  numChecksAdded = 0;
   std::vector<BasicBlock*> worklist;
   std::map<BasicBlock*, std::vector<BoundsCheck*>*> blkChecks;
   std::map<BasicBlock*, ConstraintGraph*> blkCG;
@@ -979,7 +978,7 @@ bool BoundsChecking::runOnFunction(Function &F) {
   // Insert identified checks
   errs() << "Inserting Bounds Checks\n";
   bool MadeChange = true;
-  int prevNumberChecks = 0; 
+  int prevNumberChecks = numChecksAdded;
   for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); 
               i != e; i++) {
     // Inserting Checks for given basic block
