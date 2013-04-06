@@ -190,12 +190,19 @@ class ConstraintGraph {
     void addDivEdge(Value *from, Value *to, int64_t weight);
     void killMemoryLocations();
     void print();
+    Value* findFirstLoad(Value *val1, int64_t *weight, bool *comparisonKnown);
   private:
+    CompareEnum compareStrict(ConstraintNode *node1, ConstraintNode *node2);
+    CompareEnum comparePropogate(ConstraintNode *node1, ConstraintNode *node2);
+
     int64_t treeSearch(ConstraintNode *root, ConstraintNode *target, int weight, bool *found, std::vector<ConstraintNode*> *visited);
+    int64_t treeSearchPropogate(ConstraintNode *root, ConstraintNode *target, int weight, bool *found, std::vector<ConstraintNode*> *visited);
     
+    bool findStrictPath(ConstraintNode *node1, ConstraintNode *node2, std::vector<Instruction*> *dependentInsts);
+    bool findPropogatePath(ConstraintNode *node1, ConstraintNode *node2, std::vector<Instruction*> *dependentInsts);
+
     std::vector<ConstraintNode*> nodes;
     std::map<Value*, int> memoryNodes;
-
 };
 
 ConstraintGraph::ConstraintGraph() 
@@ -212,6 +219,49 @@ ConstraintGraph::~ConstraintGraph()
   memoryNodes.clear();
 }
 
+Value* ConstraintGraph::findFirstLoad(Value *val1, int64_t *weight, bool *comparisonKnown) 
+{
+  ConstraintNode *node1 = getNode(val1, 0);
+
+  if (node1 == NULL) {
+    errs() << "Node for value  " << *val1 << " does not exist.\n"; 
+    return NULL;
+  }
+
+  ConstraintNode *root = node1;
+  int64_t w = 0;
+  bool known = true;
+  while (root != NULL) {
+    LoadInst* LI = dyn_cast<LoadInst>(root->getValue());
+    if (LI != NULL) {
+      *comparisonKnown = known;
+      *weight = w;
+      return LI->getPointerOperand();
+    }
+
+    if (root->pred == NULL) {
+    #if DEBUG_LOCAL
+      errs() << "Could not find dependent load. Returning highest root: " << *(root->getValue()) << "\n";
+    #endif
+      *comparisonKnown = known;
+      *weight = w;
+      return root->getValue();
+    }
+    int pred_weight = root->pred_weight;
+    if ((w > 0) && (pred_weight >= 0)) {
+      // keep weight at same value
+    } else if ((w < 0) && (pred_weight <= 0)) {
+      // keep weight at same value
+    } else if (w == 0) {
+      // Change weight to pred_weight value regardless as it may be more strict
+      w = pred_weight;
+    }else {
+      known = false;
+    }    
+    root = root->pred;
+  }
+  return NULL;
+}
 
 bool ConstraintGraph::findDependencyPath(Value *val1, Value *val2, std::vector<Instruction*> *dependentInsts)
 {
@@ -265,20 +315,28 @@ bool ConstraintGraph::findDependencyPath(Value *val1, Value *val2, std::vector<I
     return false;
   }
 
+  bool val = findStrictPath(node1, node2, dependentInsts);
+  if (!val) {
+    dependentInsts->clear();
+    val = findPropogatePath(node1, node2, dependentInsts);
+  }
+
+  if (!val) {
+    dependentInsts->clear();
+    errs() << "Error: Path was not identified for " << *val2 << "\n";
+    return false;
+  }
+  return val;
+}
+
+bool ConstraintGraph::findStrictPath(ConstraintNode *node1, ConstraintNode *node2, std::vector<Instruction*> *dependentInsts) 
+{
   ConstraintNode *root = node2;
   int64_t weight = 0;
   bool found = false;
   std::vector<ConstraintNode*> visited;
   while (root != node1) {
     if (root == NULL) {
-      errs() << "Error <NULL ROOT>: Path was not identified for " << *val2 << "\n";
-      dependentInsts->clear();
-      return false;
-    }
-    if (!root->canMove) {
-    #if DEBUG_LOCAL
-      errs() << "Could not move due to instruction: " << *(root->getValue()) << "\n";
-    #endif
       dependentInsts->clear();
       return false;
     }
@@ -286,6 +344,14 @@ bool ConstraintGraph::findDependencyPath(Value *val1, Value *val2, std::vector<I
     treeSearch(root, node1, weight, &found, &visited);
     if (found) {
       return true;
+    }
+    
+    if (!root->canMove) {
+    #if DEBUG_LOCAL
+      errs() << "Could not move due to instruction: " << *(root->getValue()) << "\n";
+    #endif
+      dependentInsts->clear();
+      return false;
     }
     Instruction *inst = root->getInstruction();
     if (inst != NULL) {
@@ -305,25 +371,68 @@ bool ConstraintGraph::findDependencyPath(Value *val1, Value *val2, std::vector<I
       // Change weight to pred_weight value regardless as it may be more strict
       weight = pred_weight;
     }else {
-      errs() << "Error <Weight Mismatch>: Path was not identified for " << *val2 << "\n";
       dependentInsts->clear();
       return false;
     }
 
     root = root->pred;
   }
-  errs() << "Error: Path was not identified for " << *val2 << "\n";
   dependentInsts->clear();
   return false;
 }
 
+
+bool ConstraintGraph::findPropogatePath(ConstraintNode *node1, ConstraintNode *node2, std::vector<Instruction*> *dependentInsts) 
+{
+  ConstraintNode *root = node2;
+  int64_t weight = 0;
+  bool found = false;
+  std::vector<ConstraintNode*> visited;
+  while (root != node1) {
+    if (root == NULL) {
+      dependentInsts->clear();
+      return false;
+    }
+    // Do a search from the current root
+    treeSearchPropogate(root, node1, weight, &found, &visited);
+    if (found) {
+      return true;
+    }
+    
+    if (!root->canMove) {
+    #if DEBUG_LOCAL
+      errs() << "Could not move due to instruction: " << *(root->getValue()) << "\n";
+    #endif
+      dependentInsts->clear();
+      return false;
+    }
+    Instruction *inst = root->getInstruction();
+    if (inst != NULL) {
+      dependentInsts->push_back(inst);
+    } else {
+      errs() << "Identified non-instruction node: " << *(root->getValue()) << "\n";
+      dependentInsts->clear();
+      return false;
+    }
+    visited.push_back(root);
+    if (root->pred_edge_type == ConstraintNode::UNKNOWN || root->pred_edge_type == ConstraintNode::MUL || root->pred_edge_type == ConstraintNode::DIV) {
+      return ConstraintGraph::UNKNOWN;
+    } 
+    weight = weight + root->pred_weight;
+    root = root->pred;
+  }
+  
+  dependentInsts->clear();
+  return false;
+
+}
 
 ConstraintGraph::CompareEnum ConstraintGraph::compare(Value *val1, Value *val2) 
 {
   ConstraintNode* node1 = getNode(val1, 0);
   ConstraintNode* node2 = getNode(val2, 0);
 #if DEBUG_LOCAL
-  errs() << "Comparing" << *val1 << " to" << *val2 << "\n";
+  errs() << "Comparing " << *val1 << " to " << *val2 << "\n";
 #endif
 
   ConstantInt *val_const1 = dyn_cast<ConstantInt>(val1);
@@ -389,7 +498,15 @@ ConstraintGraph::CompareEnum ConstraintGraph::compare(Value *val1, Value *val2)
     else
       return ConstraintGraph::EQUALS;
   }
-  
+  ConstraintGraph::CompareEnum val = compareStrict(node1, node2);
+  if (val == ConstraintGraph::UNKNOWN) {
+    val = comparePropogate(node1, node2);
+  }
+  return val;
+}
+
+ConstraintGraph::CompareEnum ConstraintGraph::compareStrict(ConstraintNode *node1, ConstraintNode *node2) 
+{
   ConstraintNode *root = node2;
   int64_t weight = 0;
   bool found = false;
@@ -462,6 +579,83 @@ int64_t ConstraintGraph::treeSearch(ConstraintNode *root, ConstraintNode *target
     } else if (weight == 0) {
       tempWeight = treeSearch(succ, target, succ_weight, &tempFound, visited);
     }
+    if (tempFound) {
+      visited->push_back(root);
+      *found = true;
+      return tempWeight;
+    }
+  }
+  visited->push_back(root);
+  *found = false;
+  return 0;
+}
+
+ConstraintGraph::CompareEnum ConstraintGraph::comparePropogate(ConstraintNode *node1, ConstraintNode *node2) 
+{
+  ConstraintNode *root = node2;
+  int64_t weight = 0;
+  bool found = false;
+  int64_t tmp_weight = 0;
+  std::vector<ConstraintNode*> visited;
+  while (root != node1) {
+    if (root == NULL) {
+      return ConstraintGraph::UNKNOWN;
+    } 
+    // Do a search from the current root
+    tmp_weight = treeSearchPropogate(root, node1, weight, &found, &visited);
+    if (found) {
+      weight = tmp_weight;
+      break;
+    }
+    visited.push_back(root);
+    if (root->pred_edge_type == ConstraintNode::UNKNOWN || root->pred_edge_type == ConstraintNode::MUL || root->pred_edge_type == ConstraintNode::DIV) {
+      return ConstraintGraph::UNKNOWN;
+    } 
+    weight = weight + root->pred_weight;
+    
+    root = root->pred;
+  }
+
+  if (found) {
+    if (weight > 0) 
+      return ConstraintGraph::LESS_THAN;
+    else if (weight < 0)
+      return ConstraintGraph::GREATER_THAN;
+    else
+      return ConstraintGraph::EQUALS;
+  }
+  return ConstraintGraph::UNKNOWN;
+}
+
+int64_t ConstraintGraph::treeSearchPropogate(ConstraintNode *root, ConstraintNode *target, int weight, bool *found, std::vector<ConstraintNode*> *visited)
+{
+  if (root == target) {
+    visited->push_back(target);
+    *found = true;
+    return weight;
+  }
+  
+  std::vector<ConstraintNode*> *successors = &(root->successors);
+  std::vector<int64_t> *weights = &(root->weights);
+  std::vector<ConstraintNode::EdgeType> *types = &(root->types);
+  if (successors->empty()) {
+    visited->push_back(root);
+    *found = false;
+    return 0;
+  }
+  int tempWeight;
+  bool tempFound = false;
+  for (unsigned int i = 0; i < successors->size(); i++) {
+    ConstraintNode *succ = successors->at(i);
+    ConstraintNode::EdgeType type = types->at(i); 
+    // Skip node if it has been visited
+    if (std::find(visited->begin(), visited->end(), succ) != visited->end()) 
+      continue;
+    if (type == ConstraintNode::UNKNOWN || type == ConstraintNode::MUL || type == ConstraintNode::DIV) {
+      return ConstraintGraph::UNKNOWN;
+    } 
+    weight = weights->at(i) + weight;
+    tempWeight = treeSearchPropogate(succ, target, weight, &tempFound, visited);
     if (tempFound) {
       visited->push_back(root);
       *found = true;
@@ -559,8 +753,7 @@ void ConstraintGraph::addCastEdge(Value *from, Value *to)
   ConstraintNode* fromNode = getNode(from, 0);
   if (fromNode == NULL) {
     errs() << "Casting a value that did not exist: " << *from << "\n";
-    addNode(to);
-    return;
+    fromNode = addNode(from);
   }
   ConstraintNode* toNode = getNode(to, 0);
   if (toNode != NULL) {

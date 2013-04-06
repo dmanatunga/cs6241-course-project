@@ -32,6 +32,7 @@ class BoundsCheck
     uint64_t lowerBoundValue();
     uint64_t upperBoundValue();
     
+    void setVariable(Value *v, int64_t w, bool known);
     std::vector<Instruction*> dependentInsts;
   private:
     // Value associated with the check
@@ -49,6 +50,10 @@ class BoundsCheck
     Value *upper_bound_value;
     bool insert_lower_bound;
     bool insert_upper_bound;
+
+    Value *var;
+    int64_t comparedToVar;
+    bool comparisonKnown;
 };
 
 
@@ -72,13 +77,22 @@ BoundsCheck::BoundsCheck(Instruction *I, Value *ptr, Value *ind, Value* off, Val
     upper_bound_static = false;
   }
   
-  
+  var = NULL;  
+  comparedToVar = 0;
+  comparisonKnown = false;
   insert_lower_bound = true;
   insert_upper_bound = true;
 }
 
 BoundsCheck::~BoundsCheck() 
 {
+}
+
+void BoundsCheck::setVariable(Value *v, int64_t w, bool known)
+{
+  var = v;
+  comparedToVar = w;
+  comparisonKnown = known;
 }
 
 Instruction* BoundsCheck::getInstruction() {
@@ -137,6 +151,19 @@ void BoundsCheck::print()
   errs() << "Index: " << *index << "\n";
   errs() << "Moving Check :" << (move_check ? "Yes": "No") << "\n";
   errs() << "Insert Point: " << *insertLoc << "\n";
+  if (var != NULL) {
+    if (comparisonKnown) {
+      if (comparedToVar > 0)
+        errs() << "Index: GREATER_THAN";
+      else if (comparedToVar < 0)
+        errs() << "Index: LESS_THAN";
+      else
+        errs() << "Index: EQUALS";
+      errs() << " variable: " << var->getName() << "\n";
+    } else {
+      errs() << "Index: UNKNOWN compared to variable: " << var->getName() << "\n";
+    }
+  }
 }
 
 uint64_t BoundsCheck::lowerBoundValue() 
