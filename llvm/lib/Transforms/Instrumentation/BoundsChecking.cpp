@@ -58,7 +58,7 @@ namespace {
     }
 
   private:
-    int numChecksAdded = 0;
+    int numChecksAdded;
     const DataLayout *TD;
     const TargetLibraryInfo *TLI;
     ObjectSizeOffsetEvaluator *ObjSizeEval;
@@ -780,9 +780,9 @@ bool BoundsChecking::InsertCheck(BoundsCheck* check) {
   if (check->hasLowerBoundsCheck()) {
     Type *T = Index->getType();
     numChecksAdded++;
-    bool isPointer = T->isPointerTy() && T->getContainedType(0)->isPointerTy();
+    bool isPointer = T->isPointerTy();
     if (!isPointer) {
-      Value *lowerCheck = Builder->CreateICmpSLT(Index, ConstantInt::get(IntTy, T));
+      Value *lowerCheck = Builder->CreateICmpSLT(Index, ConstantInt::get(T, 0));
       if (llvmCheck != NULL) {
         llvmCheck = Builder->CreateOr(lowerCheck, llvmCheck);
       } else {
