@@ -39,6 +39,8 @@ class BoundsCheck
     Value *pointer;
     Instruction *inst;
     Instruction *insertLoc;
+    Instruction *insertLBloc;
+    Instruction *insertUBloc;
     bool move_check;
     Value *index;
     Value *offset;

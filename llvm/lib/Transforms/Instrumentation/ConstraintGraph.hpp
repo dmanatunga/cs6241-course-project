@@ -429,14 +429,14 @@ bool ConstraintGraph::findPropogatePath(ConstraintNode *node1, ConstraintNode *n
 
 ConstraintGraph::CompareEnum ConstraintGraph::compare(Value *val1, Value *val2) 
 {
-  ConstraintNode* node1 = getNode(val1, 0);
-  ConstraintNode* node2 = getNode(val2, 0);
 #if DEBUG_LOCAL
   errs() << "Comparing " << *val1 << " to " << *val2 << "\n";
 #endif
+  ConstraintNode* node1 = getNode(val1, 0);
+  ConstraintNode* node2 = getNode(val2, 0);
 
   ConstantInt *val_const1 = dyn_cast<ConstantInt>(val1);
-  ConstantInt *val_const2 = dyn_cast<ConstantInt>(val1);
+  ConstantInt *val_const2 = dyn_cast<ConstantInt>(val2);
   bool identifiedConstants = false;
   int64_t v1 = 0;
   int64_t v2 = 0;
@@ -447,7 +447,7 @@ ConstraintGraph::CompareEnum ConstraintGraph::compare(Value *val1, Value *val2)
       identifiedConstants = true;
     } else {
       if (node2 == NULL) {
-        errs() << "Comparions Value 2 was not identified: " << *val1 << "\n";
+        errs() << "Comparions Value 2 was not identified: " << *val2 << "\n";
         return ConstraintGraph::UNKNOWN;
       } else if (node2->hasConstantValue()) {
         v2 = node2->getConstantValue();
@@ -455,13 +455,13 @@ ConstraintGraph::CompareEnum ConstraintGraph::compare(Value *val1, Value *val2)
       }
     }
   } else if (val_const2 != NULL) {
-    v2 = val_const1->getSExtValue();
+    v2 = val_const2->getSExtValue();
     if (node1 == NULL) {
       errs() << "Comparison Value 1 was not identified: " << *val1 << "\n";
       return ConstraintGraph::UNKNOWN;
     } else if (node1->hasConstantValue()) {
-      v2 = node2->getConstantValue(); 
-      identifiedConstants = false;
+      v1 = node1->getConstantValue(); 
+      identifiedConstants = true;
     }
   }
   if (identifiedConstants) {
@@ -484,7 +484,9 @@ ConstraintGraph::CompareEnum ConstraintGraph::compare(Value *val1, Value *val2)
   }
 
   if (node1 == node2) {
+  #if DEBUG_LOCAL
     errs() << "Comparing two of the same nodes\n";
+  #endif
     return ConstraintGraph::EQUALS;
   }
 
@@ -693,6 +695,9 @@ void ConstraintGraph::addStoreEdge(Value *from, Value *to, Instruction *store)
   memoryNodes[to] = id; // Store new id in memory map
   // Create toNode and to nodes list
   ConstraintNode* toNode = new ConstraintNode(to, id, store);
+  // hack: consider fixing later
+  toNode->canMove = false; // can't move past a store instruction
+
   nodes.push_back(toNode); 
   // Check if from Node is constant
   ConstantInt *ConstVal = dyn_cast<ConstantInt>(from); 
