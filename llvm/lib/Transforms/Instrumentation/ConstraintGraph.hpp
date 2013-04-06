@@ -782,10 +782,6 @@ void ConstraintGraph::addCastEdge(Value *from, Value *to)
 }
 
 void ConstraintGraph::addGEPEdge(Value* index, Value* to) {
-  ConstraintNode* indexNode = getNode(index, 0);
-  if (indexNode == NULL) {
-    errs() << "Referenced an index that did not exist: " << *index << "\n";
-  }
   ConstraintNode* toNode = getNode(to, 0);
   if (toNode != NULL) {
     errs() << "Storing to a value that already had a node created " << *to << "\n";
@@ -798,6 +794,11 @@ void ConstraintGraph::addGEPEdge(Value* index, Value* to) {
     // If from node is constant value, then store value in node
     toNode->setConstantValue(ConstVal->getSExtValue());
   } else {
+    ConstraintNode* indexNode = getNode(index, 0);
+    if (indexNode == NULL) {
+      errs() << "Referenced an index that did not exist: " << *index << "\n";
+      indexNode = addNode(index);
+    }
     // If the from node has a constant value, then set that value in store
     if (indexNode->hasConstantValue()) {
       toNode->setConstantValue(indexNode->getConstantValue());
