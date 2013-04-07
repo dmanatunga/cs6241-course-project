@@ -6,7 +6,8 @@ int main(int argc, char ** argv) {
   int arr2[3] = {3, 2, 1};
   int i = 0;
   if (argc > 1) {
-    i = arr2[i];
+    int i = 2;
+    arr[i-1] = arr2[i];
   } else {
     i = arr2[i+1];
   }

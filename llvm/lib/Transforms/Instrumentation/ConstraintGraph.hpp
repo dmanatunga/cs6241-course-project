@@ -191,6 +191,7 @@ class ConstraintGraph {
     void killMemoryLocations();
     void print();
     Value* findFirstLoad(Value *val1, int64_t *weight, bool *comparisonKnown);
+    ConstraintGraph::CompareEnum identifyChange(Value *val);
   private:
     CompareEnum compareStrict(ConstraintNode *node1, ConstraintNode *node2);
     CompareEnum comparePropogate(ConstraintNode *node1, ConstraintNode *node2);
@@ -221,6 +222,10 @@ ConstraintGraph::~ConstraintGraph()
 
 Value* ConstraintGraph::findFirstLoad(Value *val1, int64_t *weight, bool *comparisonKnown) 
 {
+  if (isa<ConstantInt>(val1)) {
+    return val1;
+  }
+
   ConstraintNode *node1 = getNode(val1, 0);
 
   if (node1 == NULL) {
@@ -730,8 +735,8 @@ void ConstraintGraph::addLoadEdge(Value *from, Value *to)
   std::map<Value*,int>::iterator it = memoryNodes.find(from);
   if (it == memoryNodes.end()) {
     // If it does not exist, create dummy node
-    memoryNodes[from] = 1;
-    fromNode = new ConstraintNode(from, 1);
+    memoryNodes[from] = 0;
+    fromNode = new ConstraintNode(from, 0);
     nodes.push_back(fromNode);
   } else {
     fromNode = getNode(from, memoryNodes[from]);
@@ -830,7 +835,7 @@ void ConstraintGraph::addMemoryNode(Value *val)
   memoryNodes[val] = 0;
   nodes.push_back(node);
 }
- 
+
 void ConstraintGraph::addAddEdge(Value *from, Value *to, int64_t weight) 
 {
   ConstraintNode* fromNode = getNode(from, 0);
@@ -944,4 +949,26 @@ void ConstraintGraph::print()
     ConstraintNode* node = *it;
     node->print();
   }
+}
+
+ConstraintGraph::CompareEnum ConstraintGraph::identifyChange(Value *val)
+{
+  std::map<Value*,int>::iterator it = memoryNodes.find(val);
+  int id = 1;
+  // Check to see if the store location exists already in memory map
+  if (it != memoryNodes.end()) {
+    // If exists, store node should be created with next id
+    // Else, start id at 1
+    id = memoryNodes[val];
+
+  } else {
+    return ConstraintGraph::EQUALS;
+  }
+  if (id == 0) {
+    return ConstraintGraph::EQUALS;
+  }
+  ConstraintNode *node1 = getNode(val, 0);
+  ConstraintNode *node2 = getNode(val , id);
+  
+  return compareStrict(node1, node2);
 }

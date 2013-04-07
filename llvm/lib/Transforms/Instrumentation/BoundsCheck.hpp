@@ -11,7 +11,7 @@ class BoundsCheck
     Value*  getUpperBound();
     Value*  getIndex();
     Value*  getOffset();
-   
+    Value*  getVariable();
 
     bool hasLowerBoundsCheck();
     bool hasUpperBoundsCheck();
@@ -19,7 +19,7 @@ class BoundsCheck
     void deleteUpperBoundsCheck();
     
     Instruction* getInsertPoint();
-    void insertBefore(Instruction* I);
+    void insertBefore(Instruction* I, bool upper);
 
     bool stillExists();
     bool moveCheck();
@@ -34,6 +34,8 @@ class BoundsCheck
     
     void setVariable(Value *v, int64_t w, bool known);
     std::vector<Instruction*> dependentInsts;
+    int64_t comparedToVar;
+    bool comparisonKnown;
   private:
     // Value associated with the check
     Value *pointer;
@@ -54,8 +56,6 @@ class BoundsCheck
     bool insert_upper_bound;
 
     Value *var;
-    int64_t comparedToVar;
-    bool comparisonKnown;
 };
 
 
@@ -67,6 +67,8 @@ BoundsCheck::BoundsCheck(Instruction *I, Value *ptr, Value *ind, Value* off, Val
   upper_bound_value = ub_val;
   offset = off;
   insertLoc = I;
+  insertLBloc = I;
+  insertUBloc = I;
   move_check = false;
   lower_bound = 0;
   lower_bound_static = true;
@@ -121,10 +123,17 @@ Instruction* BoundsCheck::getInsertPoint() {
   return insertLoc;
 }
 
+Value* BoundsCheck::getVariable() {
+  return var;
+}
 
-void BoundsCheck::insertBefore(Instruction *inst) {
+void BoundsCheck::insertBefore(Instruction *inst, bool upper) {
   move_check = insertLoc != inst;
   insertLoc = inst;
+  if (upper)
+    insertUBloc = inst;
+  else
+    insertLBloc = inst;
 }
 
 bool BoundsCheck::moveCheck() {

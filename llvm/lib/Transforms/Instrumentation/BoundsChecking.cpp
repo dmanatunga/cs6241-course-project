@@ -28,10 +28,14 @@
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Transforms/Instrumentation.h"
 #include <queue>
+#include <set>
 using namespace llvm;
-#define DEBUG_LOCAL 1
+#define DEBUG_LOCAL 0
+#define DEBUG_GLOBAL 1
+#define DEBUG_INSERT 1
 #include "BoundsCheck.hpp"
 #include "ConstraintGraph.hpp"
+#include "GlobalAnalysis.hpp"
 
 static cl::opt<bool> SingleTrapBB("bounds-checking-single-trap",
                                   cl::desc("Use one trap block per function"));
@@ -79,13 +83,14 @@ namespace {
     // Local Analysis Functions
     void LocalAnalysis(BasicBlock *blk, std::vector<BoundsCheck*> *boundsChecks, ConstraintGraph *cg);
     void getCheckVariables(std::vector<BoundsCheck*> *boundsChecks, ConstraintGraph *cg);
+    void promoteCheck(BoundsCheck* check);
+    void promoteLocalChecks(std::vector<BoundsCheck*> *boundsChecks);
     void EliminateBoundsChecks(std::vector<BoundsCheck*> *boundsChecks, ConstraintGraph *cg);
     void eliminateForwards(BoundsCheck* check1, BoundsCheck* check2, ConstraintGraph *cg);
     void eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2, ConstraintGraph *cg);
     void buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg);
     // Global Analysis Functions
     void GlobalAnalysis(std::vector<BasicBlock*> *worklist, std::map<BasicBlock*,std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG);
-    void IdentifyGenKillSets(BasicBlock *blk, std::vector<bool>* genSet, std::vector<bool>* killSet, std::vector<BoundsCheck*>* allChecks);
 
     // Loop Analysis Functions
 
@@ -612,9 +617,6 @@ void BoundsChecking::eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2
   // Compare index 1 to index 2
   ConstraintGraph::CompareEnum cmp1 = cg->compare(index1, index2);
   if (check2->hasLowerBoundsCheck() && check1->hasLowerBoundsCheck()) {
-  #if DEBUG_LOCAL
-    errs() << "Checking Lower Bound Subsuming...\n";
-  #endif
     // If check2 lower bounds check is valid
     switch (cmp1) {
       #if DEBUG_LOCAL
@@ -624,12 +626,15 @@ void BoundsChecking::eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2
       case ConstraintGraph::EQUALS:
       case ConstraintGraph::GREATER_THAN:
       #if DEBUG_LOCAL
+        errs() << "Checking Lower Bound Subsuming...\n";
+      #endif
+      #if DEBUG_LOCAL
         errs() << "Deleting Lower Bounds Check for " << *index1 << "\n";
       #endif
         // If index1 >= index2, don't need 0 <= index1
         if (cg->findDependencyPath(index1, check2->getIndex(), &(check2->dependentInsts))) {
           check1->deleteLowerBoundsCheck();
-          check2->insertBefore(dyn_cast<Instruction>(check1->getIndex()));
+          check2->insertBefore(dyn_cast<Instruction>(check1->getIndex()), false);
         }
       #if DEBUG_LOCAL
         else {
@@ -647,14 +652,14 @@ void BoundsChecking::eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2
   }
 
   if (check2->hasUpperBoundsCheck() && check1->hasUpperBoundsCheck()) {
-  #if DEBUG_LOCAL
-    errs() << "Checking Upper Bound Subsuming...\n";
-  #endif
     // If check 2 is upper bounds check valid
     ConstraintGraph::CompareEnum cmp2 = cg->compare(ub1, ub2);
     switch (cmp1) {
       case ConstraintGraph::LESS_THAN:
       case ConstraintGraph::EQUALS:
+      #if DEBUG_LOCAL
+        errs() << "Checking Upper Bound Subsuming...\n";
+      #endif
         if (cmp2 == ConstraintGraph::GREATER_THAN || cmp2 == ConstraintGraph::EQUALS) {
         #if DEBUG_LOCAL
           errs() << "Deleting Upper Bounds Check for " << *index1 << "\n";
@@ -662,7 +667,7 @@ void BoundsChecking::eliminateBackwards(BoundsCheck* check1, BoundsCheck* check2
           // If index1 <= index2, and ub2 <= ub1, don't need index1 <= ub1
           if (cg->findDependencyPath(index1, check2->getOffset(), &(check2->dependentInsts))) {
             check1->deleteUpperBoundsCheck();
-            check2->insertBefore(dyn_cast<Instruction>(check1->getIndex()));
+            check2->insertBefore(dyn_cast<Instruction>(check1->getIndex()), true);
           }
         #if DEBUG_LOCAL
           else {
@@ -741,17 +746,7 @@ void BoundsChecking::EliminateBoundsChecks(std::vector<BoundsCheck*> *boundsChec
   }
 }
 
-bool BoundsChecking::InsertCheck(BoundsCheck* check) {
-  if (!check->stillExists())
-    return false;
- 
-#if DEBUG_LOCAL
-  check->print();
-#endif
-  Inst = check->getInstruction(); 
-  Value *Size = check->getUpperBound();
-  Value *Index = check->getIndex();
-  Value *Offset = check->getOffset();
+void BoundsChecking::promoteCheck(BoundsCheck* check) {
   if (check->moveCheck()) {
     // Propogate the instructions to their new location
     Instruction *insertPoint = check->getInsertPoint();
@@ -768,6 +763,213 @@ bool BoundsChecking::InsertCheck(BoundsCheck* check) {
       insertPoint = inst;
     }
   }
+}
+
+void BoundsChecking::promoteLocalChecks(std::vector<BoundsCheck*> *boundsChecks) 
+{
+  for (std::vector<BoundsCheck*>::iterator i = boundsChecks->begin(),
+            e = boundsChecks->end(); i != e; i++) {
+    promoteCheck(*i);
+  }  
+}
+
+void BoundsChecking::LocalAnalysis(BasicBlock *blk, std::vector<BoundsCheck*> *boundsChecks, ConstraintGraph* cg) 
+{ 
+  // Identify bounds checks in block
+  IdentifyBoundsChecks(blk, boundsChecks);
+#if DEBUG_LOCAL  
+  errs() << "===================================\n";
+  errs() << "Identified Bounds Checks\n";
+  for (std::vector<BoundsCheck*>::iterator i = boundsChecks->begin(),
+        e = boundsChecks->end(); i != e; i++) {
+    BoundsCheck* check = *i;
+    check->print();
+  }
+#endif
+
+#if DEBUG_LOCAL  
+  errs() << "===================================\n";
+#endif
+
+#if DEBUG_LOCAL  
+  errs() << "===================================\n";
+  errs() << "Building Constraints Graph\n";
+#endif
+  // Build the Constraits Graph for blk
+  buildConstraintGraph(blk, cg);
+#if DEBUG_LOCAL  
+  cg->print();
+  errs() << "===================================\n";
+#endif
+
+#if DEBUG_LOCAL  
+  errs() << "===================================\n";
+  errs() << "Eliminating Bounds Checks\n";
+#endif
+  // Eliminate bounds checks from block
+  getCheckVariables(boundsChecks, cg);
+  EliminateBoundsChecks(boundsChecks, cg);
+#if DEBUG_LOCAL  
+  errs() << "===================================\n";
+#endif
+  
+#if DEBUG_LOCAL  
+  errs() << "Promoting Checks\n";
+#endif
+  promoteLocalChecks(boundsChecks);
+#if DEBUG_LOCAL  
+  errs() << "===================================\n";
+#endif
+#if DEBUG_LOCAL  
+  for (std::vector<BoundsCheck*>::iterator i = boundsChecks->begin(),
+        e = boundsChecks->end(); i != e; i++) {
+    BoundsCheck* check = *i;
+    check->print();
+  }
+  errs() << "===================================\n";
+#endif
+}
+
+
+void BoundsChecking::GlobalAnalysis(std::vector<BasicBlock*> *worklist, std::map<BasicBlock*,std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG) 
+{
+  std::vector<GlobalCheck*> allChecks;
+  std::map<BasicBlock*,BlockFlow*> flows;
+
+  // Create a block flow object for each valid block
+  for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); 
+              i != e; i++) {
+    BasicBlock *blk = *i;
+    BlockFlow *blk_flow = new BlockFlow(blk, (*blkChecks)[blk], (*blkCG)[blk], &flows);
+    flows[blk] = blk_flow;
+#if DEBUG_GLOBAL
+    errs() << "Created Flow Block for Block: " << blk->getName() << "\n";
+#endif
+  }
+
+  BasicBlock *entry = &(worklist->at(0)->getParent()->getEntryBlock());
+  flows[entry]->isEntry = true;
+  flows[entry]->identifyOutSet();
+
+#if DEBUG_GLOBAL
+  errs() << "Performing Available Check Analysis:\n";
+  int iteration = 0;
+#endif
+  // Perform the available expression analysis
+  bool change;
+  do {
+  #if DEBUG_GLOBAL
+    errs() << "Running iteration: " << iteration << "\n";
+    iteration++;
+  #endif
+    change = false;
+    for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); i != e; i++) {
+      BasicBlock *blk = *i;
+      if (blk != entry) {
+        change |= flows[blk]->identifyOutSet();
+      }
+    }
+  } while (change);
+#if DEBUG_GLOBAL
+  for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); 
+              i != e; i++) {
+    BasicBlock *blk = *i;
+    BlockFlow *blk_flow = flows[blk];
+    blk_flow->print();
+  }
+  errs() << "==============================\n";
+#endif
+#if DEBUG_GLOBAL
+  errs() << "Eliminating Redundant Checks\n";
+#endif
+  // Eliminate checks based on in set values
+  for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); i != e; i++) {
+    BasicBlock *blk = *i;
+    BlockFlow *blk_flow = flows[blk];
+  #if DEBUG_GLOBAL
+    errs() << "Eliminating Checks for Block:" << blk->getName() << "\n";
+  #endif
+    blk_flow->eliminateRedundantChecks();
+  }
+#if DEBUG_GLOBAL
+  errs() << "==============================\n";
+#endif
+}
+
+bool BoundsChecking::runOnFunction(Function &F) {
+  TD = &getAnalysis<DataLayout>();
+  TLI = &getAnalysis<TargetLibraryInfo>();
+
+  TrapBB = 0;
+  BuilderTy TheBuilder(F.getContext(), TargetFolder(TD));
+  Builder = &TheBuilder;
+  ObjectSizeOffsetEvaluator TheObjSizeEval(TD, TLI, F.getContext());
+  ObjSizeEval = &TheObjSizeEval;
+  
+  std::vector<BasicBlock*> worklist;
+  std::map<BasicBlock*, std::vector<BoundsCheck*>*> blkChecks;
+  std::map<BasicBlock*, ConstraintGraph*> blkCG;
+ 
+  // Identify basic blocks in function
+  for (Function::iterator i = F.begin(), e = F.end(); i != e; ++i) {
+    BasicBlock* blk =  &*i;
+    worklist.push_back(blk);
+    blkCG[blk] = new ConstraintGraph();
+    blkChecks[blk] = new std::vector<BoundsCheck*>();
+  }
+
+  // Iterate over the Basic Blocks and perform local analysis
+  for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); 
+              i != e; i++) {
+    BasicBlock *blk = *i;
+    LocalAnalysis(blk, blkChecks[blk], blkCG[blk]);
+  }
+ 
+  // Perform Global Analysis
+  errs() << "Global Analysis\n";
+  GlobalAnalysis(&worklist, &blkChecks, &blkCG);
+  // Perform Loop Analysis
+    
+  // Insert identified checks
+  errs() << "Inserting Bounds Checks\n";
+  bool MadeChange = true;
+  int prevNumberChecks = numChecksAdded;
+  for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); 
+              i != e; i++) {
+    // Inserting Checks for given basic block
+    BasicBlock* blk =  *i;
+    MadeChange |= InsertChecks(blkChecks[blk]);
+    errs() << "Basic Block (name=" << blk->getName() << "):";
+    errs() << (numChecksAdded - prevNumberChecks)  << " Checks Added\n";
+    prevNumberChecks = numChecksAdded;
+  }
+  errs() << "===================================\n";
+  errs() << "Total Number of Checks Addded: " << numChecksAdded << "\n";
+
+#if DEBUG_LOCAL
+  for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
+    Instruction *I = &*i;
+    errs() << *I << "\n";
+  }
+#endif
+  return MadeChange;
+}
+
+FunctionPass *llvm::createBoundsCheckingPass(unsigned Penalty) {
+  return new BoundsChecking(Penalty);
+}
+
+bool BoundsChecking::InsertCheck(BoundsCheck* check) {
+  if (!check->stillExists())
+    return false;
+ 
+#if DEBUG_INSERT
+  check->print();
+#endif
+  Inst = check->getInstruction(); 
+  Value *Size = check->getUpperBound();
+  Value *Index = check->getIndex();
+  Value *Offset = check->getOffset();
 
   
   Builder->SetInsertPoint(check->getInsertPoint());
@@ -806,207 +1008,3 @@ bool BoundsChecking::InsertChecks(std::vector<BoundsCheck*> *boundsChecks) {
   }  
   return MadeChange;
 }
-
-void BoundsChecking::LocalAnalysis(BasicBlock *blk, std::vector<BoundsCheck*> *boundsChecks, ConstraintGraph* cg) {
-  
-#if DEBUG_LOCAL  
-  errs() << "===================================\n";
-  errs() << "Identified Bounds Checks\n";
-#endif
-  // Identify bounds checks in block
-  IdentifyBoundsChecks(blk, boundsChecks);
-  for (std::vector<BoundsCheck*>::iterator i = boundsChecks->begin(),
-        e = boundsChecks->end(); i != e; i++) {
-    BoundsCheck* check = *i;
-    check->print();
-  }
-#if DEBUG_LOCAL  
-  errs() << "===================================\n";
-#endif
-
-#if DEBUG_LOCAL  
-  errs() << "===================================\n";
-  errs() << "Building Constraints Graph\n";
-#endif
-  // Build the Constraits Graph for blk
-  buildConstraintGraph(blk, cg);
-#if DEBUG_LOCAL  
-  cg->print();
-  errs() << "===================================\n";
-#endif
-
-#if DEBUG_LOCAL  
-  errs() << "===================================\n";
-  errs() << "Eliminating Bounds Checks\n";
-#endif
-  // Eliminate bounds checks from block
-  getCheckVariables(boundsChecks, cg);
-  EliminateBoundsChecks(boundsChecks, cg);
-#if DEBUG_LOCAL  
-  errs() << "===================================\n";
-#endif
-  
-#if DEBUG_LOCAL  
-  errs() << "After Elimination Bounds Checks\n";
-  for (std::vector<BoundsCheck*>::iterator i = boundsChecks->begin(),
-        e = boundsChecks->end(); i != e; i++) {
-    BoundsCheck* check = *i;
-    check->print();
-  }
-  errs() << "===================================\n";
-#endif
-}
-
-void BoundsChecking::IdentifyGenKillSets(BasicBlock *blk, std::vector<bool>* genSet, std::vector<bool>* killSet, std::vector<BoundsCheck*>* allChecks) 
-{
-
-}
-
-void BoundsChecking::GlobalAnalysis(std::vector<BasicBlock*> *worklist, std::map<BasicBlock*,std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG) 
-{
-  std::vector<BoundsCheck*> allChecks;
-  // Conglemerate all checks into one vector
-  for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); 
-              i != e; i++) {
-    BasicBlock *blk = *i;
-    std::vector<BoundsCheck*> *checks = (*blkChecks)[blk];
-    for (std::vector<BoundsCheck*>::iterator it = checks->begin(), et = checks->end(); it != et; it++) {
-      BoundsCheck *chk = *it;
-      allChecks.push_back(chk);
-    }
-  }
-
-  unsigned int numChecks = allChecks.size();
-  std::map<BasicBlock*, std::vector<bool>*> GEN;
-  std::map<BasicBlock*, std::vector<bool>*> KILL;
-
-  // Create GEN and KILL sets
-  for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); i != e; i++) {
-    BasicBlock *blk = *i;
-    std::vector<bool>* genSet = new std::vector<bool>(numChecks);
-    std::vector<bool>* killSet = new std::vector<bool>(numChecks);
-    IdentifyGenKillSets(blk, genSet, killSet, &allChecks);
-    GEN[blk] = genSet;
-    KILL[blk] = killSet;
-  }
-
-  std::map<BasicBlock*, std::vector<bool>*> IN;
-  std::map<BasicBlock*, std::vector<bool>*> OUT;
-
-  BasicBlock *entry = &(worklist->at(0)->getParent()->getEntryBlock());
-  
-  for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); i != e; i++) {
-    BasicBlock *blk = *i;
-    IN[blk] = new std::vector<bool>(numChecks);
-    OUT[blk] = new std::vector<bool>(numChecks);
-    for (unsigned int i = 0; i < numChecks; i++) {
-      (*OUT[blk])[i] = true;
-    }
-  }
-
-  // Out set of entry is just the gen set
-  for (unsigned int i = 0; i < numChecks; i++) {
-    (*OUT[entry])[i] = (*GEN[entry])[i];
-  }
-  
-  bool change;
-  do {
-    change = false;
-    for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); i != e; i++) {
-      BasicBlock *blk = *i;
-      if (blk != entry) {
-        std::vector<bool>* inSet = IN[blk];
-        std::vector<bool>* outSet = OUT[blk];
-        std::vector<bool>* genSet = GEN[blk];
-        std::vector<bool>* killSet = KILL[blk];
-        // Perform the intersection over all predecessors
-        for (pred_iterator PI = pred_begin(blk), E = pred_end(blk); PI != E; ++PI) {
-          BasicBlock *pred = *PI;
-          std::vector<bool> *pred_out = OUT[pred];
-          for (unsigned int i = 0; i < numChecks; i++) {
-            (*inSet)[i] = (*inSet)[i] && (*pred_out)[i];
-          }
-        }
-        // Combine in set with gen set - kill set)
-        for (unsigned int i = 0; i < numChecks; i++) {
-          bool old_val = (*outSet)[i];
-          bool new_val = (*genSet)[i] || ((*inSet)[i] && ~((*killSet)[i]));
-          if (old_val != new_val) {
-            change = true;
-          }
-        }
-      }
-    }
-  } while (change);
-  
-  // Eliminate checks based on in set values
-  for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); i != e; i++) {
-    BasicBlock *blk = *i;
-    if (blk != entry) {
-
-    }
-  }
-}
-
-bool BoundsChecking::runOnFunction(Function &F) {
-  TD = &getAnalysis<DataLayout>();
-  TLI = &getAnalysis<TargetLibraryInfo>();
-
-  TrapBB = 0;
-  BuilderTy TheBuilder(F.getContext(), TargetFolder(TD));
-  Builder = &TheBuilder;
-  ObjectSizeOffsetEvaluator TheObjSizeEval(TD, TLI, F.getContext());
-  ObjSizeEval = &TheObjSizeEval;
-  
-  std::vector<BasicBlock*> worklist;
-  std::map<BasicBlock*, std::vector<BoundsCheck*>*> blkChecks;
-  std::map<BasicBlock*, ConstraintGraph*> blkCG;
- 
-  // Identify basic blocks in function
-  for (Function::iterator i = F.begin(), e = F.end(); i != e; ++i) {
-    BasicBlock* blk =  &*i;
-    worklist.push_back(blk);
-    blkCG[blk] = new ConstraintGraph();
-    blkChecks[blk] = new std::vector<BoundsCheck*>();
-  }
-
-  // Iterate over the Basic Blocks and perform local analysis
-  for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); 
-              i != e; i++) {
-    BasicBlock *blk = *i;
-    LocalAnalysis(blk, blkChecks[blk], blkCG[blk]);
-  }
- 
-  // Perform Global Analysis
-  //GlobalAnalysis(&worklist, &blkChecks, &blkCG);
-  // Perform Loop Analysis
-    
-  // Insert identified checks
-  errs() << "Inserting Bounds Checks\n";
-  bool MadeChange = true;
-  int prevNumberChecks = numChecksAdded;
-  for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); 
-              i != e; i++) {
-    // Inserting Checks for given basic block
-    BasicBlock* blk =  *i;
-    MadeChange |= InsertChecks(blkChecks[blk]);
-    errs() << "Basic Block (name=" << blk->getName() << "):";
-    errs() << (numChecksAdded - prevNumberChecks)  << " Checks Added\n";
-    prevNumberChecks = numChecksAdded;
-  }
-  errs() << "===================================\n";
-  errs() << "Total Number of Checks Addded: " << numChecksAdded << "\n";
-
-#if DEBUG_LOCAL
-  for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
-    Instruction *I = &*i;
-    errs() << *I << "\n";
-  }
-#endif
-  return MadeChange;
-}
-
-FunctionPass *llvm::createBoundsCheckingPass(unsigned Penalty) {
-  return new BoundsChecking(Penalty);
-}
-
