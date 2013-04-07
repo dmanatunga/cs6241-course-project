@@ -35,11 +35,15 @@
 #include <list>
 #include <set>
 using namespace llvm;
-#define DEBUG_IDENTIFY 1 
-#define DEBUG_LOCAL 1
-#define DEBUG_GLOBAL 1
-#define DEBUG_LOOP 1
-#define DEBUG_INSERT 1
+
+#define DEBUG_IDENTIFY 0
+#define DEBUG_LOCAL 0
+#define DEBUG_SHOW_UNHANDLED_OPS 0
+#define DEBUG_GLOBAL 0
+#define DEBUG_LOOP 0
+#define DEBUG_INSERT 0
+#define DEBUG_INSTS 0 
+
 #include "BoundsCheck.hpp"
 #include "ConstraintGraph.hpp"
 #include "GlobalAnalysis.hpp"
@@ -102,8 +106,9 @@ namespace {
     // Global Analysis Functions
     void GlobalAnalysis(std::vector<BasicBlock*> *worklist, std::map<BasicBlock*,std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG);
     // Loop Analysis Functions
-    void LoopAnalysis(std::map<BasicBlock*, std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG);
+    void LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<BasicBlock*, std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG);
     void addLoopIntoQueue(Loop *L, std::list<Loop*> *loopQueue);
+    void hoistCheck(BoundsCheck* check);
     // Bounds Checks Insertion Functions
     bool InsertCheck(BoundsCheck* check);
     bool InsertChecks(std::vector<BoundsCheck*> *boundsCheck);
@@ -465,11 +470,16 @@ void BoundsChecking::buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg) 
             cg->addNode(I);
           }
       } else {
+        cg->addNode(I);
+      #if DEBUG_SHOW_UNHANDLED_OPS
         errs() << "Handle opcode: " << I->getOpcodeName() << "?: " << *I << "\n";
+      #endif
       }
     } else {
       cg->addNode(I);
+    #if DEBUG_SHOW_UNHANDLED_OPS
       errs() << "Handle opcode: " << I->getOpcodeName() << "?: " << *I << "\n";
+    #endif
     }
   }
 }
@@ -760,7 +770,32 @@ void BoundsChecking::EliminateBoundsChecks(std::vector<BoundsCheck*> *boundsChec
   }
 }
 
+void BoundsChecking::hoistCheck(BoundsCheck* check) 
+{
+  if (!check->stillExists())
+    return;
+  if (check->shouldHoistCheck()) {
+    // Propogate the instructions to their new location
+    Instruction *insertPoint = check->getInsertPoint();
+    #if DEBUG_LOOP
+      errs() << "Inserting Instructions at: " <<  *insertPoint << "\n";
+    #endif
+    for (std::vector<Instruction*>::iterator i = check->dependentInsts.begin(),
+             e = check->dependentInsts.end(); i != e; i++) {
+      Instruction *inst = *i;
+    #if DEBUG_LOOP
+      errs() << "Hoisting instruction: " << *inst << " before " << *insertPoint << "\n";
+    #endif
+      inst->moveBefore(insertPoint);
+      insertPoint = inst;
+    }
+  }
+}
+
 void BoundsChecking::promoteCheck(BoundsCheck* check) {
+  if (!check->stillExists())
+    return;
+
   if (check->moveCheck()) {
     // Propogate the instructions to their new location
     Instruction *insertPoint = check->getInsertPoint();
@@ -854,11 +889,12 @@ void BoundsChecking::GlobalAnalysis(std::vector<BasicBlock*> *worklist, std::map
   for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); 
               i != e; i++) {
     BasicBlock *blk = *i;
+#if DEBUG_GLOBAL
+    errs() << "===================================\n";
+    errs() << "Creating Flow Block for Block: " << blk->getName() << "\n";
+#endif
     BlockFlow *blk_flow = new BlockFlow(blk, (*blkChecks)[blk], (*blkCG)[blk], &flows);
     flows[blk] = blk_flow;
-#if DEBUG_GLOBAL
-    errs() << "Created Flow Block for Block: " << blk->getName() << "\n";
-#endif
   }
 
   BasicBlock *entry = &(worklist->at(0)->getParent()->getEntryBlock());
@@ -919,7 +955,7 @@ void BoundsChecking::addLoopIntoQueue(Loop *L, std::list<Loop*> *loopQueue)
   }
 }
 
-void BoundsChecking::LoopAnalysis(std::map<BasicBlock*,std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG) 
+void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<BasicBlock*,std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG) 
 {
   LoopInfo *LoopInf = &getAnalysis<LoopInfo>();
   DominatorTree *DomTree = &getAnalysis<DominatorTree>();
@@ -941,25 +977,139 @@ void BoundsChecking::LoopAnalysis(std::map<BasicBlock*,std::vector<BoundsCheck*>
     if (isSimplified) {
       PreHeader = loop->getLoopPreheader();
       ExitBlock = loop->getExitBlock();
+    #if DEBUG_LOOP
+      errs() << "Loop Preheader: " << PreHeader->getName() << "\n";
+      errs() << "Loop Exit: " << ExitBlock->getName() << "\n";
+    #endif
     } else {
       errs() << "Loop is not in simplified form. Run Loop Simplify Pass.\n";
     #if DEBUG_LOOP
       errs() << "==============================\n";
       loop->dump();
       errs() << "==============================\n";
+      return;
     #endif
     }
     if (ExitBlock && PreHeader) {
+      // Identify variables that change values in loops and variables that do not change values
+      std::set<Value*> storeSet;
+      bool canHoist = true;
       for (Loop::block_iterator loopBlkI = loop->block_begin(), loopBlkE = loop->block_end(); loopBlkI != loopBlkE; ++loopBlkI) {
         BasicBlock *loopBlk = *loopBlkI;
-        std::vector<BoundsCheck*> *checks = (*blkChecks)[loopBlk];
-        for (std::vector<BoundsCheck*>::iterator chkI = checks->begin(), chkE = checks->end(); chkI != chkE; chkI++) {
-          BoundsCheck* chk = *chkI;
-          if (loop->isLoopInvariant(chk->getIndex())) {
-            chk->print();
+        for (BasicBlock::iterator i = loopBlk->begin(), e = loopBlk->end(); i != e; ++i) {
+          Instruction *inst = &*i;
+          if (isa<CallInst>(inst)) {
+            canHoist = false;
+            break;
+          }
+          StoreInst *SI = dyn_cast<StoreInst>(inst);
+          if (SI != NULL) {
+            storeSet.insert(SI->getPointerOperand());
+            Value *to = SI->getPointerOperand();
+            Type* T = to->getType();
+            bool isPointer = T->isPointerTy() && T->getContainedType(0)->isPointerTy();
+            if (isPointer) {
+              canHoist = false;
+            }
           }
         }
       }
+      
+      if (!canHoist) {
+      #if DEBUG_LOOP
+        errs() << "Cannot hoist operations out of loop due to pointer aliasing or function call\n";
+      #endif
+        continue;
+      }
+      std::vector<BoundsCheck*> *preheaderChecks = (*blkChecks)[PreHeader];
+      for (Loop::block_iterator loopBlkI = loop->block_begin(), loopBlkE = loop->block_end(); loopBlkI != loopBlkE; ++loopBlkI) {
+        BasicBlock *loopBlk = *loopBlkI;
+        std::vector<BoundsCheck*> *checks = (*blkChecks)[loopBlk];
+        ConstraintGraph *cg = (*blkCG)[loopBlk];
+        for (std::vector<BoundsCheck*>::iterator chkI = checks->begin(); chkI != checks->end(); ) {
+          BoundsCheck* chk = *chkI;
+          if (!chk->stillExists()) {
+            // Skip deleted checks
+            chkI++;
+            continue;
+          }
+
+          if (loop->isLoopInvariant(chk->getIndex())) {
+          #if DEBUG_LOOP
+            errs() << "===========================\n";
+            errs() << "--Identified Invariant Check:\n"; 
+            chk->print();
+          #endif
+            if (chk->shouldHoistCheck()) {
+              // Check has been hoisted once already 
+              chk->hoistCheck(PreHeader);
+              // Move the check up to the preheader
+              preheaderChecks->push_back(chk);
+              chkI = checks->erase(chkI);
+              continue;
+            } else if(cg->findDependencyPath(chk->getOffset(), &(chk->dependentInsts))) {
+              // Check has been hoisted once already 
+              chk->hoistCheck(PreHeader);
+              // Move the check up to the preheader
+              preheaderChecks->push_back(chk);
+              chkI = checks->erase(chkI);
+              continue;
+            }
+          #if DEBUG_LOOP
+            else {
+              errs() << "Could not hoist check...\n";
+            }
+          #endif
+          } else {
+            Value *var = chk->getVariable();
+            if (var != NULL) {
+              if (isa<AllocaInst>(var)) {
+                if (storeSet.find(var) == storeSet.end()) {
+                #if DEBUG_LOOP
+                  errs() << "===========================\n";
+                  errs() << "--Identified Invariant Check:\n"; 
+                  chk->print();
+                #endif
+                  if (chk->shouldHoistCheck()) {
+                    // Check has been hoisted once already 
+                    chk->hoistCheck(PreHeader);
+                    // Move the check up to the preheader
+                    preheaderChecks->push_back(chk);
+                    chkI = checks->erase(chkI);
+                    continue;
+                  } else if (cg->findDependencyPath(chk->getOffset(), &(chk->dependentInsts))) {
+                    // Check has been hoisted once already 
+                    chk->hoistCheck(PreHeader);
+                    // Move the check up to the preheader
+                    preheaderChecks->push_back(chk);
+                    chkI = checks->erase(chkI);
+                    continue;
+                  }
+                #if DEBUG_LOOP
+                  else {
+                    errs() << "Could not hoist check...\n";
+                  }
+                #endif
+                }
+              }
+            }                    
+          #if DEBUG_LOOP
+            errs() << "===========================\n";
+            errs() << "--Following Check is not Invariant\n";
+            chk->print();
+            errs() << "===========================\n";
+          #endif
+          }
+          chkI++;
+        }
+      }
+    }
+  }
+  for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); i != e; i++) {
+    BasicBlock *blk = *i;
+    std::vector<BoundsCheck*> *checks  = (*blkChecks)[blk];
+    for (std::vector<BoundsCheck*>::iterator ci = checks->begin(), ce = checks->end(); ci != ce; ci++) {
+      hoistCheck(*ci);
     }
   }
 }
@@ -977,7 +1127,8 @@ bool BoundsChecking::runOnFunction(Function &F) {
   std::vector<BasicBlock*> worklist;
   std::map<BasicBlock*, std::vector<BoundsCheck*>*> blkChecks;
   std::map<BasicBlock*, ConstraintGraph*> blkCG;
- 
+
+  numChecksAdded = 0;
   // Identify basic blocks in function
   for (Function::iterator i = F.begin(), e = F.end(); i != e; ++i) {
     BasicBlock* blk =  &*i;
@@ -988,8 +1139,7 @@ bool BoundsChecking::runOnFunction(Function &F) {
 
   errs() << "--Performing Local Analysis\n";
   // Iterate over the Basic Blocks and perform local analysis
-  for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); 
-              i != e; i++) {
+  for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); i != e; i++) {
     BasicBlock *blk = *i;
     LocalAnalysis(blk, blkChecks[blk], blkCG[blk]);
   }
@@ -999,7 +1149,7 @@ bool BoundsChecking::runOnFunction(Function &F) {
   GlobalAnalysis(&worklist, &blkChecks, &blkCG);
   // Perform Loop Analysis
   errs() << "--Performing Loop Analysis\n";
-  LoopAnalysis(&blkChecks, &blkCG);
+  LoopAnalysis(&worklist, &blkChecks, &blkCG);
   // Insert identified checks
   errs() << "--Inserting Bounds Checks\n";
   bool MadeChange = true;
@@ -1016,7 +1166,7 @@ bool BoundsChecking::runOnFunction(Function &F) {
   errs() << "===================================\n";
   errs() << "--Total Number of Checks Addded: " << numChecksAdded << "\n";
 
-#if DEBUG_LOCAL
+#if DEBUG_INSTS
   for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
     Instruction *I = &*i;
     errs() << *I << "\n";
@@ -1035,6 +1185,7 @@ bool BoundsChecking::InsertCheck(BoundsCheck* check) {
  
 #if DEBUG_INSERT
   check->print();
+  errs() << "===================================\n";
 #endif
   Inst = check->getInstruction(); 
   Value *Size = check->getUpperBound();

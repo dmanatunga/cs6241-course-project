@@ -112,6 +112,7 @@ class BlockFlow
     std::vector<GlobalCheck*> globalChecks;
     ConstraintGraph *cg;
     std::map<Instruction*, unsigned int> instLoc;
+    bool killAll;
 };
 
 BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintGraph *graph, std::map<BasicBlock*,BlockFlow*> *f) 
@@ -123,22 +124,29 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
   numInsts = 0;
   isEntry = false;
   outSet.allChecks = true;
-#if DEBUG_GLOBAL
-  errs() << "Identifying locations of instructions in Basic Block\n";
-#endif
+  killAll = false;
   for (BasicBlock::iterator i = blk->begin(), e = blk->end(); i != e; ++i) {
     Instruction *inst = &*i;
     numInsts++;
     instructions.push_back(inst);
     instLoc[i] = numInsts;
     StoreInst *SI = dyn_cast<StoreInst>(inst);
+    if (isa<CallInst>(inst)) {
+      killAll = true;
+    }
     if (SI != NULL) {
-      storeSet.insert(SI);
+      storeSet.insert(SI->getPointerOperand());
+      Value *to = SI->getPointerOperand();
+      Type* T = to->getType();
+      bool isPointer = T->isPointerTy() && T->getContainedType(0)->isPointerTy();
+      if (isPointer) {
+        killAll = true;;
+      }
     }
   }
 
 #if DEBUG_GLOBAL
-  errs() << "Identifying Downward Exposed Bounds Checks\n";
+  errs() << "Identifying Downward Exposed Bounds Checks:" << blk->getName() << "\n";
 #endif
   for (std::vector<BoundsCheck*>::iterator it = checks->begin(), et = checks->end(); it != et; it++) {
     BoundsCheck *chk = *it;
@@ -161,7 +169,16 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
     // Inefficient, basically go through the remaining instructions
     // and see if there is a store to the same location
     for (unsigned int i = loc; i <= numInsts; i++) {
-      StoreInst *SI = dyn_cast<StoreInst>(instructions.at(i-1));
+      Instruction *inst = instructions.at(i-1);
+      StoreInst *SI = dyn_cast<StoreInst>(inst);
+      if (isa<CallInst>(inst)) {
+        downwardExposed = false;
+      #if DEBUG_GLOBAL
+        errs() << "Following Check is not downward exposed\n";
+        chk->print();
+      #endif
+        break;
+      }
       if (SI != NULL) {
         if (var == SI->getPointerOperand()) {
           downwardExposed = false;
@@ -170,6 +187,18 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
           chk->print();
         #endif
           break;
+        } else {
+          Value *to = SI->getPointerOperand();
+          Type* T = to->getType();
+          bool isPointer = T->isPointerTy() && T->getContainedType(0)->isPointerTy();
+          if (isPointer) {
+            downwardExposed = false;
+          #if DEBUG_GLOBAL
+            errs() << "Following Check is not downward exposed\n";
+            chk->print();
+          #endif
+            break;
+          }
         }
       }
     }
@@ -191,7 +220,8 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
         }
         if (add) {
         #if DEBUG_GLOBAL
-          errs() << "Downward Exposed Lower-Bound Check:\n";
+          errs() << "==============================" << "\n";
+          errs() << "Adding Downward Exposed Lower-Bound Check to GEN set:\n";
           chk->print();
         #endif
           gCheck = new GlobalCheck(chk, var, NULL, false, loc);
@@ -212,7 +242,8 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
         }
         if (add) {
         #if DEBUG_GLOBAL
-          errs() << "Downward Exposed Upper-Bound Check:\n";
+          errs() << "==============================" << "\n";
+          errs() << "Adding Downward Exposed Upper-Bound Check to GEN set:\n";
           chk->print();
         #endif
           gCheck = new GlobalCheck(chk, var, chk->getUpperBound(), true, loc);
@@ -333,9 +364,8 @@ bool BlockFlow::identifyOutSet()
 {
   bool MadeChange = false;
   std::vector<GlobalCheck*> outChecks;
-  if (!isEntry) {
+  if (!isEntry && !killAll) {
     identifyInSet();
-    
   #if DEBUG_GLOBAL
     errs() << "Generating Out-Set: " << blk->getName() << "\n";
   #endif
@@ -435,17 +465,27 @@ bool BlockFlow::identifyOutSet()
       outChecks.push_back(chk);
     }
   }  
-
+  
   if (isEntry && outChecks.empty()) {
     outSet.allChecks = false;
     return true;
   }
 
-  if (outChecks.empty() && inSet.allChecks) {
-    bool oldState = outSet.allChecks;
-    outSet.checks.clear();
-    outSet.allChecks = true;
-    return oldState != true;
+  if (outChecks.empty()) {
+    if (inSet.allChecks) {
+      bool oldState = outSet.allChecks;
+      outSet.checks.clear();
+      outSet.allChecks = true;
+      return oldState != true;
+    } else {
+      outSet.allChecks = false;
+      if (outSet.checks.empty()) {
+        return false;
+      } else {
+        outSet.checks.clear();
+        return true;
+      }
+    }
   }
 
   for (std::vector<GlobalCheck*>::iterator i = outChecks.begin(), e = outChecks.end(); i != e; i++) {
@@ -527,7 +567,11 @@ void BlockFlow::print()
   }
   errs() << "Out Set: ";
   if (outSet.checks.empty()) {
-    errs() << "EMPTY" << "\n";
+    if (outSet.allChecks) {
+      errs() << "ALL CHECKS" << "\n";
+    } else {
+      errs() << "EMPTY" << "\n";
+    }
   } else {
     for (std::vector<GlobalCheck*>::iterator i = outSet.checks.begin(), e = outSet.checks.end(); i != e; i++) {
       GlobalCheck *chk = *i;

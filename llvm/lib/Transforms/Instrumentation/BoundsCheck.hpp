@@ -23,12 +23,14 @@ class BoundsCheck
 
     bool stillExists();
     bool moveCheck();
+    bool shouldHoistCheck();
     void print();
     
     void addLowerBoundsCheck();
     void addUpperBoundsCheck();
     Instruction* getInstruction();
 
+    void hoistCheck(BasicBlock *blk);
     uint64_t lowerBoundValue();
     uint64_t upperBoundValue();
     
@@ -46,6 +48,9 @@ class BoundsCheck
     bool move_check;
     Value *index;
     Value *offset;
+
+    BasicBlock *hoistBlock;
+    bool hoist_check;
 
     uint64_t lower_bound;
     bool lower_bound_static;
@@ -73,6 +78,9 @@ BoundsCheck::BoundsCheck(Instruction *I, Value *ptr, Value *ind, Value* off, Val
   lower_bound = 0;
   lower_bound_static = true;
 
+  hoistBlock = NULL;
+  hoist_check = false;
+  
   ConstantInt *ub_const = dyn_cast<ConstantInt>(ub_val);
   if (ub_const != NULL) {
     upper_bound = ub_const->getZExtValue();
@@ -90,6 +98,22 @@ BoundsCheck::BoundsCheck(Instruction *I, Value *ptr, Value *ind, Value* off, Val
 
 BoundsCheck::~BoundsCheck() 
 {
+}
+
+bool BoundsCheck::shouldHoistCheck()
+{
+  return hoist_check;
+}
+
+void BoundsCheck::hoistCheck(BasicBlock *blk)
+{
+  hoistBlock = blk; 
+  insertLoc = blk->getTerminator();
+  
+  insertUBloc = insertLoc;
+  insertLBloc = insertLoc;
+  hoist_check = true;
+  move_check = true;
 }
 
 void BoundsCheck::setVariable(Value *v, int64_t w, bool known)
@@ -128,7 +152,7 @@ Value* BoundsCheck::getVariable() {
 }
 
 void BoundsCheck::insertBefore(Instruction *inst, bool upper) {
-  move_check = insertLoc != inst;
+  move_check = true;
   insertLoc = inst;
   if (upper)
     insertUBloc = inst;
@@ -146,7 +170,6 @@ bool BoundsCheck::stillExists() {
 
 void BoundsCheck::print()
 {
-  errs() << "===========================\n";
   errs() << "Instruction: " << *inst << "\n";
   if (insert_lower_bound) {
     errs() << "Lower Bound Check: " << lower_bound << "\n";
@@ -160,8 +183,12 @@ void BoundsCheck::print()
     errs() << "Upper Bound Check (DELETED): " << *upper_bound_value << "\n";
   }
   errs() << "Index: " << *index << "\n";
-  errs() << "Moving Check :" << (move_check ? "Yes": "No") << "\n";
+  errs() << "Offset: " << *offset << "\n";
+  errs() << "Moving Check: " << (move_check ? "Yes": "No") << "\n";
   errs() << "Insert Point: " << *insertLoc << "\n";
+  if (hoist_check) {
+    errs() << "Hoisted to Block: " << hoistBlock->getName() << "\n";
+  }
   if (var != NULL) {
     if (comparisonKnown) {
       if (comparedToVar > 0)

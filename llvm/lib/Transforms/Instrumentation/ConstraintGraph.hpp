@@ -175,6 +175,7 @@ class ConstraintGraph {
     ~ConstraintGraph();
 
     CompareEnum compare(Value *val1, Value *val2);
+    bool findDependencyPath(Value *val1, std::vector<Instruction*> *dependentInsts);
     bool findDependencyPath(Value *val1, Value *val2, std::vector<Instruction*> *dependentInsts);
     ConstraintNode* getNode(Value *val, int id);
     void addStoreEdge(Value *from, Value *to, Instruction *store);
@@ -218,6 +219,42 @@ ConstraintGraph::~ConstraintGraph()
   }
   nodes.clear();
   memoryNodes.clear();
+}
+
+bool ConstraintGraph::findDependencyPath(Value *val1, std::vector<Instruction*> *dependentInsts)
+{
+  if (isa<ConstantInt>(val1)) {
+    return true;
+  }
+
+  ConstraintNode *node1 = getNode(val1, 0);
+
+  if (node1 == NULL) {
+    errs() << "Node for value  " << *val1 << " does not exist.\n"; 
+    return false;
+  }
+  dependentInsts->clear();
+  ConstraintNode *root = node1;
+  while (root != NULL) {
+    if (!root->canMove) {
+      dependentInsts->clear();
+      return false;
+    }
+    dependentInsts->push_back(root->getInstruction());
+    LoadInst* LI = dyn_cast<LoadInst>(root->getValue());
+    if (LI != NULL) {
+      return true;
+    }
+
+    if (root->pred == NULL) {
+    #if DEBUG_LOOP
+      errs() << "Could not find dependent load. Returning highest root: " << *(root->getValue()) << "\n";
+    #endif
+      return true;
+    }
+    root = root->pred;
+  }
+  return false;
 }
 
 Value* ConstraintGraph::findFirstLoad(Value *val1, int64_t *weight, bool *comparisonKnown) 
