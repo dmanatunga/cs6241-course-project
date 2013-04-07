@@ -35,10 +35,11 @@
 #include <list>
 #include <set>
 using namespace llvm;
-#define DEBUG_LOCAL 0
-#define DEBUG_GLOBAL 0
+#define DEBUG_IDENTIFY 1 
+#define DEBUG_LOCAL 1
+#define DEBUG_GLOBAL 1
 #define DEBUG_LOOP 1
-#define DEBUG_INSERT 0
+#define DEBUG_INSERT 1
 #include "BoundsCheck.hpp"
 #include "ConstraintGraph.hpp"
 #include "GlobalAnalysis.hpp"
@@ -790,9 +791,9 @@ void BoundsChecking::LocalAnalysis(BasicBlock *blk, std::vector<BoundsCheck*> *b
 { 
   // Identify bounds checks in block
   IdentifyBoundsChecks(blk, boundsChecks);
-#if DEBUG_LOCAL  
+#if DEBUG_IDENTIFY 
   errs() << "===================================\n";
-  errs() << "Identified Bounds Checks\n";
+  errs() << "Identified Bounds Checks: " << blk->getName() << "\n";
   for (std::vector<BoundsCheck*>::iterator i = boundsChecks->begin(),
         e = boundsChecks->end(); i != e; i++) {
     BoundsCheck* check = *i;

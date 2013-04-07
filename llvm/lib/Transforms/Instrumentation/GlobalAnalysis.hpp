@@ -229,9 +229,8 @@ void BlockFlow::identifyInSet()
   errs() << "Generating In-Set: " << blk->getName() << "\n";
 #endif
   inSet.checks.clear();
-  inSet.allChecks = true;
   std::vector<GlobalCheck*> inChecks; 
-
+  bool foundChecks = false;
   for (pred_iterator PI = pred_begin(blk), E = pred_end(blk); PI != E; ++PI) {
     BasicBlock *pred = *PI;
     BlockFlow *pred_flow = (*flows)[pred]; 
@@ -239,6 +238,7 @@ void BlockFlow::identifyInSet()
       #if DEBUG_GLOBAL
         errs() << "Adding checks from predecessor: " << pred->getName() << "\n";
       #endif
+      foundChecks = true;
       for (std::vector<GlobalCheck*>::iterator i = pred_flow->outSet.checks.begin(), e = pred_flow->outSet.checks.end();
               i != e; i++) {
         inChecks.push_back(*i);
@@ -247,10 +247,15 @@ void BlockFlow::identifyInSet()
     }
   }
   
-  if (inChecks.empty()) {
+  if (inChecks.empty() && foundChecks) {
+    inSet.allChecks = false;
+    return;
+  } else if (inChecks.empty()) {
+    inSet.allChecks = true;
     return;
   }
   
+  inSet.allChecks = false;
   for (std::vector<GlobalCheck*>::iterator i = inChecks.begin(), e = inChecks.end(); i != e; i++) { 
     GlobalCheck* chk = *i;
     bool existsInAllPreds = true;
@@ -330,8 +335,9 @@ bool BlockFlow::identifyOutSet()
   std::vector<GlobalCheck*> outChecks;
   if (!isEntry) {
     identifyInSet();
+    
   #if DEBUG_GLOBAL
-    errs() << "Generating In-Set: " << blk->getName() << "\n";
+    errs() << "Generating Out-Set: " << blk->getName() << "\n";
   #endif
     // Identify checks from inSet that should be killed
     for (std::vector<GlobalCheck*>::iterator i = inSet.checks.begin(), e = inSet.checks.end();
@@ -369,7 +375,7 @@ bool BlockFlow::identifyOutSet()
   }
 #if DEBUG_GLOBAL
   else {
-    errs() << "Generating In-Set: " << blk->getName() << "\n";
+    errs() << "Generating Out-Set: " << blk->getName() << "\n";
   }
 #endif
   // Just identify checks that are live at the end of set
@@ -429,7 +435,19 @@ bool BlockFlow::identifyOutSet()
       outChecks.push_back(chk);
     }
   }  
-  
+
+  if (isEntry && outChecks.empty()) {
+    outSet.allChecks = false;
+    return true;
+  }
+
+  if (outChecks.empty() && inSet.allChecks) {
+    bool oldState = outSet.allChecks;
+    outSet.checks.clear();
+    outSet.allChecks = true;
+    return oldState != true;
+  }
+
   for (std::vector<GlobalCheck*>::iterator i = outChecks.begin(), e = outChecks.end(); i != e; i++) {
   #if DEBUG_GLOBAL
     errs() << "Adding Check to Out Set:\n";
