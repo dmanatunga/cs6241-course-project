@@ -327,8 +327,8 @@ bool BlockFlow::identifyOutSet()
             i != e; i++) {
       // For each global check, see if it survives past block, or if we can tell how variable changes 
       GlobalCheck *chk = *i;
-      std::set<Value*>::iterator i = storeSet.find(chk->var);
-      if (i == storeSet.end()) {
+      std::set<Value*>::iterator it = storeSet.find(chk->var);
+      if (it == storeSet.end()) {
         outChecks.push_back(chk);
       } else {
         ConstraintGraph::CompareEnum change = cg->identifyChange(chk->var); 
