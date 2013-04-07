@@ -149,9 +149,12 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
 
     Value *var = chk->getVariable();
     if (var == NULL) {
-      errs() << "Could not identify index value for following check:\n";
-      chk->print();
-      continue;
+      var = chk->getIndex();
+      if (var == NULL) {
+        errs() << "Could not identify index value for following check:\n";
+        chk->print();
+        continue;
+      }
     }
     bool downwardExposed = true;
     // Find downward exposed checks

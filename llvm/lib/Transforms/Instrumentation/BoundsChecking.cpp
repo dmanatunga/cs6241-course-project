@@ -67,7 +67,7 @@ namespace {
       AU.addRequired<TargetLibraryInfo>();
       AU.addRequired<LoopInfo>();
       AU.addRequired<DominatorTree>();
-      AU.addRequiredID(LoopSimplifyID);
+      //AU.addRequiredID(LoopSimplifyID);
     }
 
   private:
@@ -113,8 +113,8 @@ char BoundsChecking::ID = 0;
 INITIALIZE_PASS_BEGIN(BoundsChecking, "bounds-checking", "Run-time bounds checking", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTree)
 INITIALIZE_PASS_DEPENDENCY(LoopInfo)
-INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
-INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
+//INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
+INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfo)
 INITIALIZE_PASS_END(BoundsChecking, "bounds-checking", "Run-time bounds checking", false, false)
 
 
@@ -940,6 +940,13 @@ void BoundsChecking::LoopAnalysis(std::map<BasicBlock*,std::vector<BoundsCheck*>
     if (isSimplified) {
       PreHeader = loop->getLoopPreheader();
       ExitBlock = loop->getExitBlock();
+    } else {
+      errs() << "Loop is not in simplified form. Run Loop Simplify Pass.\n";
+    #if DEBUG_LOOP
+      errs() << "==============================\n";
+      loop->dump();
+      errs() << "==============================\n";
+    #endif
     }
     if (ExitBlock && PreHeader) {
       for (Loop::block_iterator loopBlkI = loop->block_begin(), loopBlkE = loop->block_end(); loopBlkI != loopBlkE; ++loopBlkI) {
