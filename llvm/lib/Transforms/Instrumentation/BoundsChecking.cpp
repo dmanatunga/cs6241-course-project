@@ -18,6 +18,9 @@
 #include "llvm/Pass.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
+#include "llvm/Analysis/Dominators.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/LoopPass.h"
 #include "llvm/Support/CFG.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -27,12 +30,15 @@
 #include "llvm/DataLayout.h"
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Transforms/Instrumentation.h"
+#include "llvm/Transforms/Scalar.h"
 #include <queue>
+#include <list>
 #include <set>
 using namespace llvm;
 #define DEBUG_LOCAL 0
-#define DEBUG_GLOBAL 1
-#define DEBUG_INSERT 1
+#define DEBUG_GLOBAL 0
+#define DEBUG_LOOP 1
+#define DEBUG_INSERT 0
 #include "BoundsCheck.hpp"
 #include "ConstraintGraph.hpp"
 #include "GlobalAnalysis.hpp"
@@ -59,6 +65,9 @@ namespace {
     virtual void getAnalysisUsage(AnalysisUsage &AU) const {
       AU.addRequired<DataLayout>();
       AU.addRequired<TargetLibraryInfo>();
+      AU.addRequired<LoopInfo>();
+      AU.addRequired<DominatorTree>();
+      AU.addRequiredID(LoopSimplifyID);
     }
 
   private:
@@ -91,9 +100,9 @@ namespace {
     void buildConstraintGraph(BasicBlock *blk, ConstraintGraph *cg);
     // Global Analysis Functions
     void GlobalAnalysis(std::vector<BasicBlock*> *worklist, std::map<BasicBlock*,std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG);
-
     // Loop Analysis Functions
-
+    void LoopAnalysis(std::map<BasicBlock*, std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG);
+    void addLoopIntoQueue(Loop *L, std::list<Loop*> *loopQueue);
     // Bounds Checks Insertion Functions
     bool InsertCheck(BoundsCheck* check);
     bool InsertChecks(std::vector<BoundsCheck*> *boundsCheck);
@@ -101,8 +110,12 @@ namespace {
 }
 
 char BoundsChecking::ID = 0;
-INITIALIZE_PASS(BoundsChecking, "bounds-checking", "Run-time bounds checking",
-                false, false)
+INITIALIZE_PASS_BEGIN(BoundsChecking, "bounds-checking", "Run-time bounds checking", false, false)
+INITIALIZE_PASS_DEPENDENCY(DominatorTree)
+INITIALIZE_PASS_DEPENDENCY(LoopInfo)
+INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
+INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
+INITIALIZE_PASS_END(BoundsChecking, "bounds-checking", "Run-time bounds checking", false, false)
 
 
 /// getTrapBB - create a basic block that traps. All overflowing conditions
@@ -896,6 +909,53 @@ void BoundsChecking::GlobalAnalysis(std::vector<BasicBlock*> *worklist, std::map
 #endif
 }
 
+void BoundsChecking::addLoopIntoQueue(Loop *L, std::list<Loop*> *loopQueue)
+{
+  loopQueue->push_front(L);
+  const std::vector<Loop *> &subLoop = L->getSubLoops();
+  for (size_t I = 0; I < subLoop.size(); ++I) {
+    addLoopIntoQueue(subLoop[I], loopQueue);
+  }
+}
+
+void BoundsChecking::LoopAnalysis(std::map<BasicBlock*,std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG) 
+{
+  LoopInfo *LoopInf = &getAnalysis<LoopInfo>();
+  DominatorTree *DomTree = &getAnalysis<DominatorTree>();
+  // Candidate check which can be hoisted for each bbl
+  std::map<BasicBlock*, std::vector<BoundsCheck*>*> candidates;
+
+  std::list<Loop*> LoopQueue;
+
+  for (LoopInfo::iterator LoopI = LoopInf->begin(), LoopE = LoopInf->end(); LoopI != LoopE; ++LoopI) {
+    addLoopIntoQueue(*LoopI, &LoopQueue); 
+  }
+
+  for (std::list<Loop*>::iterator LoopI = LoopQueue.begin(), LoopE = LoopQueue.end(); LoopI != LoopE; ++LoopI) {
+    Loop* loop = *LoopI;
+    bool isSimplified = loop->isLoopSimplifyForm();
+    BasicBlock *PreHeader = NULL;
+    BasicBlock *ExitBlock = NULL;
+    std::vector<BasicBlock*> *ND;
+    if (isSimplified) {
+      PreHeader = loop->getLoopPreheader();
+      ExitBlock = loop->getExitBlock();
+    }
+    if (ExitBlock && PreHeader) {
+      for (Loop::block_iterator loopBlkI = loop->block_begin(), loopBlkE = loop->block_end(); loopBlkI != loopBlkE; ++loopBlkI) {
+        BasicBlock *loopBlk = *loopBlkI;
+        std::vector<BoundsCheck*> *checks = (*blkChecks)[loopBlk];
+        for (std::vector<BoundsCheck*>::iterator chkI = checks->begin(), chkE = checks->end(); chkI != chkE; chkI++) {
+          BoundsCheck* chk = *chkI;
+          if (loop->isLoopInvariant(chk->getIndex())) {
+            chk->print();
+          }
+        }
+      }
+    }
+  }
+}
+
 bool BoundsChecking::runOnFunction(Function &F) {
   TD = &getAnalysis<DataLayout>();
   TLI = &getAnalysis<TargetLibraryInfo>();
@@ -918,6 +978,7 @@ bool BoundsChecking::runOnFunction(Function &F) {
     blkChecks[blk] = new std::vector<BoundsCheck*>();
   }
 
+  errs() << "--Performing Local Analysis\n";
   // Iterate over the Basic Blocks and perform local analysis
   for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); 
               i != e; i++) {
@@ -926,12 +987,13 @@ bool BoundsChecking::runOnFunction(Function &F) {
   }
  
   // Perform Global Analysis
-  errs() << "Global Analysis\n";
+  errs() << "--Performing Global Analysis\n";
   GlobalAnalysis(&worklist, &blkChecks, &blkCG);
   // Perform Loop Analysis
-    
+  errs() << "--Performing Loop Analysis\n";
+  LoopAnalysis(&blkChecks, &blkCG);
   // Insert identified checks
-  errs() << "Inserting Bounds Checks\n";
+  errs() << "--Inserting Bounds Checks\n";
   bool MadeChange = true;
   int prevNumberChecks = numChecksAdded;
   for (std::vector<BasicBlock*>::iterator i = worklist.begin(), e = worklist.end(); 
@@ -944,7 +1006,7 @@ bool BoundsChecking::runOnFunction(Function &F) {
     prevNumberChecks = numChecksAdded;
   }
   errs() << "===================================\n";
-  errs() << "Total Number of Checks Addded: " << numChecksAdded << "\n";
+  errs() << "--Total Number of Checks Addded: " << numChecksAdded << "\n";
 
 #if DEBUG_LOCAL
   for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {

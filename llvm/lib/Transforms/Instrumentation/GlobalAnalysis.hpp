@@ -148,6 +148,11 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
     unsigned int loc = instLoc[chk->getInsertPoint()]; 
 
     Value *var = chk->getVariable();
+    if (var == NULL) {
+      errs() << "Could not identify index value for following check:\n";
+      chk->print();
+      continue;
+    }
     bool downwardExposed = true;
     // Find downward exposed checks
     // Inefficient, basically go through the remaining instructions
@@ -318,10 +323,13 @@ void BlockFlow::identifyInSet()
 
 bool BlockFlow::identifyOutSet()
 {
-  identifyInSet();
   bool MadeChange = false;
   std::vector<GlobalCheck*> outChecks;
   if (!isEntry) {
+    identifyInSet();
+  #if DEBUG_GLOBAL
+    errs() << "Generating In-Set: " << blk->getName() << "\n";
+  #endif
     // Identify checks from inSet that should be killed
     for (std::vector<GlobalCheck*>::iterator i = inSet.checks.begin(), e = inSet.checks.end();
             i != e; i++) {
@@ -356,6 +364,11 @@ bool BlockFlow::identifyOutSet()
       }
     }
   }
+#if DEBUG_GLOBAL
+  else {
+    errs() << "Generating In-Set: " << blk->getName() << "\n";
+  }
+#endif
   // Just identify checks that are live at the end of set
   for (std::vector<GlobalCheck*>::iterator i = globalChecks.begin(), e = globalChecks.end(); 
               i != e; i++) {
