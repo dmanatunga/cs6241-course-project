@@ -45,8 +45,8 @@ using namespace llvm;
 #define DEBUG_INSTS 0 
 #define DEBUG_CODE 0
 
-#include "BoundsCheck.hpp"
 #include "ConstraintGraph.hpp"
+#include "BoundsCheck.hpp"
 #include "GlobalAnalysis.hpp"
 #include "Monotonic.hpp"
 
@@ -1049,8 +1049,9 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
               chkI = checks->erase(chkI);
               continue;
             } else if(cg->findDependencyPath(chk->getOffset(), &(chk->dependentInsts))) {
-              // Check has been hoisted once already 
+              // Hoist Check 
               chk->hoistCheck(PreHeader);
+              chk->originalBlock = loopBlk;
               // Move the check up to the preheader
               preheaderChecks->push_back(chk);
               chkI = checks->erase(chkI);
@@ -1081,6 +1082,7 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
                   } else if (cg->findDependencyPath(chk->getOffset(), &(chk->dependentInsts))) {
                     // Check has been hoisted once already 
                     chk->hoistCheck(PreHeader);
+                    chk->originalBlock = loopBlk;
                     // Move the check up to the preheader
                     preheaderChecks->push_back(chk);
                     chkI = checks->erase(chkI);
@@ -1189,6 +1191,9 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
                     errs() << "--Identified Monotonic Increasing LB Move\n";
                     monCheck->print();
                   #endif
+                    if (check->shouldHoistCheck()) {
+                      cg = (*blkCG)[check->originalBlock];
+                    }
                     if (cg->findDependencyPath(monCheck->getIndex(), &(monCheck->dependentInsts))) {
                       check->deleteLowerBoundsCheck();
                       preheaderChecks->push_back(monCheck);
@@ -1211,6 +1216,9 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
                     errs() << "--Identified Monotonic Increasing UB Move\n";
                     monCheck->print();
                   #endif
+                    if (check->shouldHoistCheck()) {
+                      cg = (*blkCG)[check->originalBlock];
+                    }
                     if (cg->findDependencyPath(monCheck->getIndex(), &(monCheck->dependentInsts))) {
                       check->deleteUpperBoundsCheck(); // Delete upper bound that is being replaced
                       preheaderChecks->push_back(monCheck);

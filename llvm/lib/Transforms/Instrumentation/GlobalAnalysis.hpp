@@ -112,7 +112,9 @@ class BlockFlow
     std::vector<GlobalCheck*> globalChecks;
     ConstraintGraph *cg;
     std::map<Instruction*, unsigned int> instLoc;
+    std::map<Value*, unsigned int> lastStoreLoc;
     bool killAll;
+    unsigned int killAllLoc;
 };
 
 BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintGraph *graph, std::map<BasicBlock*,BlockFlow*> *f) 
@@ -125,6 +127,7 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
   isEntry = false;
   outSet.allChecks = true;
   killAll = false;
+  killAllLoc = 0;
   for (BasicBlock::iterator i = blk->begin(), e = blk->end(); i != e; ++i) {
     Instruction *inst = &*i;
     numInsts++;
@@ -133,6 +136,7 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
     StoreInst *SI = dyn_cast<StoreInst>(inst);
     if (isa<CallInst>(inst)) {
       killAll = true;
+      killAllLoc = numInsts;
     }
     if (SI != NULL) {
       storeSet.insert(SI->getPointerOperand());
@@ -140,8 +144,10 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
       Type* T = to->getType();
       bool isPointer = T->isPointerTy() && T->getContainedType(0)->isPointerTy();
       if (isPointer) {
-        killAll = true;;
+        killAll = true;
+        killAllLoc = numInsts;
       }
+      lastStoreLoc[to] = numInsts;
     }
   }
 
@@ -152,9 +158,9 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
     BoundsCheck *chk = *it;
     if (!chk->stillExists()) 
       continue;
+
     // May require fixing later?
     unsigned int loc = instLoc[chk->getInsertPoint()]; 
-
     Value *var = chk->getVariable();
     if (var == NULL) {
       var = chk->getIndex();
@@ -164,6 +170,7 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
         continue;
       }
     }
+    /**
     bool downwardExposed = true;
     // Find downward exposed checks
     // Inefficient, basically go through the remaining instructions
@@ -205,12 +212,29 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
 
     if (!downwardExposed)
       continue;
+    **/
+    if (loc < killAllLoc) {
+      continue;
+    }
+
+    bool blkHasStore = false;
+    if (lastStoreLoc.find(var) != lastStoreLoc.end()) {
+      blkHasStore = true;
+    }
 
     GlobalCheck *gCheck;
-    // Insert upper bounds check if downward exposed, and index <= to variable it references
+    // Insert lower bounds check if downward exposed, and index <= to variable it references
     if (chk->hasLowerBoundsCheck()){
       if (chk->comparisonKnown && chk->comparedToVar <= 0) {
         bool add = true;
+        ConstraintGraph::CompareEnum varChange = cg->identifyMemoryChange(var);
+        // Check if there is a store instruction after the check
+        if (blkHasStore && (lastStoreLoc[var] > loc)) {
+          // If index variable becomes smaller across basic block, can't add lower bounds check
+          if (varChange == ConstraintGraph::LESS_THAN || varChange == ConstraintGraph::UNKNOWN) {
+            add = false;
+          }
+        }
         for (std::vector<GlobalCheck*>::iterator gi = globalChecks.begin(), ge = globalChecks.end();
               gi != ge; gi++) {
           GlobalCheck *c = *gi;
@@ -221,7 +245,7 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
         if (add) {
         #if DEBUG_GLOBAL
           errs() << "==============================" << "\n";
-          errs() << "Adding Downward Exposed Lower-Bound Check to GEN set:\n";
+          errs() << "Adding Lower-Bound Check to GEN set:\n";
           chk->print();
         #endif
           gCheck = new GlobalCheck(chk, var, NULL, false, loc);
@@ -233,6 +257,14 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
     if (chk->hasUpperBoundsCheck()){
       if (chk->comparisonKnown && chk->comparedToVar >= 0) {
         bool add = true;
+        ConstraintGraph::CompareEnum varChange = cg->identifyMemoryChange(var);
+        // Check if there is a store instruction after the check
+        if (blkHasStore && (lastStoreLoc[var] > loc)) {
+          // If index variable becomes bigger across basic block, can't add upper bounds check
+          if (varChange == ConstraintGraph::GREATER_THAN || varChange == ConstraintGraph::UNKNOWN) {
+            add = false;
+          }
+        }
         for (std::vector<GlobalCheck*>::iterator gi = globalChecks.begin(), ge = globalChecks.end();
               gi != ge; gi++) {
           GlobalCheck *c = *gi;
@@ -243,7 +275,7 @@ BlockFlow::BlockFlow(BasicBlock *b, std::vector<BoundsCheck*> *chks, ConstraintG
         if (add) {
         #if DEBUG_GLOBAL
           errs() << "==============================" << "\n";
-          errs() << "Adding Downward Exposed Upper-Bound Check to GEN set:\n";
+          errs() << "Adding Exposed Upper-Bound Check to GEN set:\n";
           chk->print();
         #endif
           gCheck = new GlobalCheck(chk, var, chk->getUpperBound(), true, loc);

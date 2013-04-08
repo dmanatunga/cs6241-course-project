@@ -44,6 +44,7 @@ class BoundsCheck
     void restoreOriginalCheck();
     BoundsCheck* createCopyAt(BasicBlock *blk);
     BoundsCheck* originalCheck;
+    BasicBlock *originalBlock;
   private:
     // Value associated with the check
     Value *pointer;
@@ -84,7 +85,8 @@ BoundsCheck::BoundsCheck(Instruction *I, Value *ptr, Value *ind, Value* off, Val
   move_check = false;
   lower_bound = 0;
   lower_bound_static = true;
-
+  
+  originalBlock = inst->getParent();
   hoistBlock = NULL;
   hoist_check = false;
   
