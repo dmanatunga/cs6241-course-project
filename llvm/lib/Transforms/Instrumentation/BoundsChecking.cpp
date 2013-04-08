@@ -1204,7 +1204,6 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
                   // Only move upper-bound check out, if we know that the computed index is smaller than the var
                   if (check->comparedToVar <=0) {
                     BoundsCheck *monCheck = check->createCopyAt(PreHeader);
-                    check->deleteUpperBoundsCheck(); // Delete upper bound that is being replaced
                     monCheck->deleteLowerBoundsCheck(); // Don't need lower bound
                     // Find path from load to index
                   #if DEBUG_LOOP
@@ -1213,7 +1212,7 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
                     monCheck->print();
                   #endif
                     if (cg->findDependencyPath(monCheck->getIndex(), &(monCheck->dependentInsts))) {
-                      check->deleteLowerBoundsCheck();
+                      check->deleteUpperBoundsCheck(); // Delete upper bound that is being replaced
                       preheaderChecks->push_back(monCheck);
                     } else {
                   #if DEBUG_LOOP
