@@ -142,6 +142,9 @@ BoundsCheck* BoundsCheck::createCopyAt(BasicBlock *blk)
   check->insertLoc = blk->getTerminator();
   check->insertUBloc = insertLoc;
   check->insertLBloc = insertLoc;
+  check->comparedToVar = comparedToVar;
+  check->var = var;
+  check->comparisonKnown = comparisonKnown;
   return check;
 }
 
