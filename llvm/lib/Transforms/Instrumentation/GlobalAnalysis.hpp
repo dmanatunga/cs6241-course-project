@@ -378,7 +378,7 @@ bool BlockFlow::identifyOutSet()
       if (it == storeSet.end()) {
         outChecks.push_back(chk);
       } else {
-        ConstraintGraph::CompareEnum change = cg->identifyChange(chk->var); 
+        ConstraintGraph::CompareEnum change = cg->identifyMemoryChange(chk->var); 
         if (chk->isUpper) {
           // Upper-bound check
           switch (change) {

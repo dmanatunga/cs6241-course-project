@@ -192,7 +192,7 @@ class ConstraintGraph {
     void killMemoryLocations();
     void print();
     Value* findFirstLoad(Value *val1, int64_t *weight, bool *comparisonKnown);
-    ConstraintGraph::CompareEnum identifyChange(Value *val);
+    ConstraintGraph::CompareEnum identifyMemoryChange(Value *val);
   private:
     CompareEnum compareStrict(ConstraintNode *node1, ConstraintNode *node2);
     CompareEnum comparePropogate(ConstraintNode *node1, ConstraintNode *node2);
@@ -416,7 +416,9 @@ bool ConstraintGraph::findStrictPath(ConstraintNode *node1, ConstraintNode *node
       dependentInsts->clear();
       return false;
     }
-
+    if (root->pred == node1) {
+      return true;
+    }
     root = root->pred;
   }
   dependentInsts->clear();
@@ -461,6 +463,9 @@ bool ConstraintGraph::findPropogatePath(ConstraintNode *node1, ConstraintNode *n
       return ConstraintGraph::UNKNOWN;
     } 
     weight = weight + root->pred_weight;
+    if (root->pred == node1) {
+      return true;
+    }
     root = root->pred;
   }
   
@@ -579,6 +584,9 @@ ConstraintGraph::CompareEnum ConstraintGraph::compareStrict(ConstraintNode *node
       // Differing weights so return unknown
       return ConstraintGraph::UNKNOWN;
     }
+    if (root->pred == node1) {
+      found = true;
+    }
     root = root->pred;
   }
 
@@ -622,6 +630,8 @@ int64_t ConstraintGraph::treeSearch(ConstraintNode *root, ConstraintNode *target
       tempWeight = treeSearch(succ, target, weight, &tempFound, visited);  
     } else if (weight == 0) {
       tempWeight = treeSearch(succ, target, succ_weight, &tempFound, visited);
+    } else {
+      continue;
     }
     if (tempFound) {
       visited->push_back(root);
@@ -656,7 +666,10 @@ ConstraintGraph::CompareEnum ConstraintGraph::comparePropogate(ConstraintNode *n
       return ConstraintGraph::UNKNOWN;
     } 
     weight = weight + root->pred_weight;
-    
+    if (root->pred == node1) {
+      found = true;
+      break;
+    }  
     root = root->pred;
   }
 
@@ -698,8 +711,8 @@ int64_t ConstraintGraph::treeSearchPropogate(ConstraintNode *root, ConstraintNod
     if (type == ConstraintNode::UNKNOWN || type == ConstraintNode::MUL || type == ConstraintNode::DIV) {
       return ConstraintGraph::UNKNOWN;
     } 
-    weight = weights->at(i) + weight;
-    tempWeight = treeSearchPropogate(succ, target, weight, &tempFound, visited);
+    tempWeight = weights->at(i) + weight;
+    tempWeight = treeSearchPropogate(succ, target, tempWeight, &tempFound, visited);
     if (tempFound) {
       visited->push_back(root);
       *found = true;
@@ -774,6 +787,7 @@ void ConstraintGraph::addLoadEdge(Value *from, Value *to)
     // If it does not exist, create dummy node
     memoryNodes[from] = 0;
     fromNode = new ConstraintNode(from, 0);
+    fromNode->canMove = false;
     nodes.push_back(fromNode);
   } else {
     fromNode = getNode(from, memoryNodes[from]);
@@ -988,24 +1002,35 @@ void ConstraintGraph::print()
   }
 }
 
-ConstraintGraph::CompareEnum ConstraintGraph::identifyChange(Value *val)
+ConstraintGraph::CompareEnum ConstraintGraph::identifyMemoryChange(Value *val)
 {
   std::map<Value*,int>::iterator it = memoryNodes.find(val);
   int id = 1;
   // Check to see if the store location exists already in memory map
   if (it != memoryNodes.end()) {
-    // If exists, store node should be created with next id
+    // If it exists, store node should be created with next id
     // Else, start id at 1
     id = memoryNodes[val];
-
   } else {
     return ConstraintGraph::EQUALS;
   }
+
   if (id == 0) {
     return ConstraintGraph::EQUALS;
   }
   ConstraintNode *node1 = getNode(val, 0);
-  ConstraintNode *node2 = getNode(val , id);
-  
-  return compareStrict(node1, node2);
+  if (node1 == NULL) {
+    return ConstraintGraph::UNKNOWN;
+  }
+  ConstraintNode *node2 = getNode(val, id);
+    
+  ConstraintGraph::CompareEnum cmp = compareStrict(node1, node2);
+  switch (cmp) {
+    case ConstraintGraph::LESS_THAN:
+      return ConstraintGraph::GREATER_THAN;
+    case ConstraintGraph::GREATER_THAN:
+      return ConstraintGraph::LESS_THAN;
+    default:
+      return cmp;
+  }
 }

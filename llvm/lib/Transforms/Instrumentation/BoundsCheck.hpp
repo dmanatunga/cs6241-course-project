@@ -12,7 +12,8 @@ class BoundsCheck
     Value*  getIndex();
     Value*  getOffset();
     Value*  getVariable();
-
+    void setIndex(Value *val);
+    void setOffset(Value *val);
     bool hasLowerBoundsCheck();
     bool hasUpperBoundsCheck();
     void deleteLowerBoundsCheck();
@@ -21,6 +22,7 @@ class BoundsCheck
     Instruction* getInsertPoint();
     void insertBefore(Instruction* I, bool upper);
 
+    bool isCopy();
     bool stillExists();
     bool moveCheck();
     bool shouldHoistCheck();
@@ -38,6 +40,10 @@ class BoundsCheck
     std::vector<Instruction*> dependentInsts;
     int64_t comparedToVar;
     bool comparisonKnown;
+    
+    void restoreOriginalCheck();
+    BoundsCheck* createCopyAt(BasicBlock *blk);
+    BoundsCheck* originalCheck;
   private:
     // Value associated with the check
     Value *pointer;
@@ -61,6 +67,7 @@ class BoundsCheck
     bool insert_upper_bound;
 
     Value *var;
+    bool is_copy;
 };
 
 
@@ -81,6 +88,7 @@ BoundsCheck::BoundsCheck(Instruction *I, Value *ptr, Value *ind, Value* off, Val
   hoistBlock = NULL;
   hoist_check = false;
   
+  originalCheck = NULL;
   ConstantInt *ub_const = dyn_cast<ConstantInt>(ub_val);
   if (ub_const != NULL) {
     upper_bound = ub_const->getZExtValue();
@@ -94,16 +102,59 @@ BoundsCheck::BoundsCheck(Instruction *I, Value *ptr, Value *ind, Value* off, Val
   comparisonKnown = false;
   insert_lower_bound = true;
   insert_upper_bound = true;
+  is_copy = false;
 }
+
 
 BoundsCheck::~BoundsCheck() 
 {
+}
+
+void BoundsCheck::setIndex(Value *val) 
+{
+  index = val;
+}
+
+void BoundsCheck::setOffset(Value *val)
+{
+  offset = val;
+}
+
+void BoundsCheck::restoreOriginalCheck() 
+{
+  if (originalCheck == NULL)
+    return;
+
+  if (insert_lower_bound) {
+    originalCheck->insert_lower_bound = true;
+  }
+  
+  if (insert_upper_bound) {
+    originalCheck->insert_upper_bound = true;
+  }
+}
+
+BoundsCheck* BoundsCheck::createCopyAt(BasicBlock *blk)
+{
+  BoundsCheck *check = new BoundsCheck(inst, pointer, index, offset, upper_bound_value);
+  check->originalCheck = this;
+  check->is_copy = true;
+  check->insertLoc = blk->getTerminator();
+  check->insertUBloc = insertLoc;
+  check->insertLBloc = insertLoc;
+  return check;
 }
 
 bool BoundsCheck::shouldHoistCheck()
 {
   return hoist_check;
 }
+
+bool BoundsCheck::isCopy()
+{
+  return is_copy;
+}
+
 
 void BoundsCheck::hoistCheck(BasicBlock *blk)
 {

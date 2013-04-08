@@ -43,10 +43,12 @@ using namespace llvm;
 #define DEBUG_LOOP 0
 #define DEBUG_INSERT 0
 #define DEBUG_INSTS 0 
+#define DEBUG_CODE 0
 
 #include "BoundsCheck.hpp"
 #include "ConstraintGraph.hpp"
 #include "GlobalAnalysis.hpp"
+#include "Monotonic.hpp"
 
 static cl::opt<bool> SingleTrapBB("bounds-checking-single-trap",
                                   cl::desc("Use one trap block per function"));
@@ -109,6 +111,7 @@ namespace {
     void LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<BasicBlock*, std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG);
     void addLoopIntoQueue(Loop *L, std::list<Loop*> *loopQueue);
     void hoistCheck(BoundsCheck* check);
+    bool handleCopyCheck(BoundsCheck *check);
     // Bounds Checks Insertion Functions
     bool InsertCheck(BoundsCheck* check);
     bool InsertChecks(std::vector<BoundsCheck*> *boundsCheck);
@@ -958,7 +961,6 @@ void BoundsChecking::addLoopIntoQueue(Loop *L, std::list<Loop*> *loopQueue)
 void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<BasicBlock*,std::vector<BoundsCheck*>*> *blkChecks, std::map<BasicBlock*,ConstraintGraph*> *blkCG) 
 {
   LoopInfo *LoopInf = &getAnalysis<LoopInfo>();
-  DominatorTree *DomTree = &getAnalysis<DominatorTree>();
   // Candidate check which can be hoisted for each bbl
   std::map<BasicBlock*, std::vector<BoundsCheck*>*> candidates;
 
@@ -973,7 +975,6 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
     bool isSimplified = loop->isLoopSimplifyForm();
     BasicBlock *PreHeader = NULL;
     BasicBlock *ExitBlock = NULL;
-    std::vector<BasicBlock*> *ND;
     if (isSimplified) {
       PreHeader = loop->getLoopPreheader();
       ExitBlock = loop->getExitBlock();
@@ -991,9 +992,10 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
     #endif
     }
     if (ExitBlock && PreHeader) {
+      std::vector<BoundsCheck*> *preheaderChecks = (*blkChecks)[PreHeader];
       // Identify variables that change values in loops and variables that do not change values
       std::set<Value*> storeSet;
-      bool canHoist = true;
+      bool canHoist = true; 
       for (Loop::block_iterator loopBlkI = loop->block_begin(), loopBlkE = loop->block_end(); loopBlkI != loopBlkE; ++loopBlkI) {
         BasicBlock *loopBlk = *loopBlkI;
         for (BasicBlock::iterator i = loopBlk->begin(), e = loopBlk->end(); i != e; ++i) {
@@ -1021,7 +1023,6 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
       #endif
         continue;
       }
-      std::vector<BoundsCheck*> *preheaderChecks = (*blkChecks)[PreHeader];
       for (Loop::block_iterator loopBlkI = loop->block_begin(), loopBlkE = loop->block_end(); loopBlkI != loopBlkE; ++loopBlkI) {
         BasicBlock *loopBlk = *loopBlkI;
         std::vector<BoundsCheck*> *checks = (*blkChecks)[loopBlk];
@@ -1103,6 +1104,133 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
           chkI++;
         }
       }
+      // Identify monotonocity in checks
+      std::map<BasicBlock*, VarFlow*> flows;
+      std::set<Value*> checkVars;
+      for (Loop::block_iterator loopBlkI = loop->block_begin(), loopBlkE = loop->block_end(); loopBlkI != loopBlkE; ++loopBlkI) {
+        BasicBlock *loopBlk = *loopBlkI;
+        std::vector<BoundsCheck*> *checks = (*blkChecks)[loopBlk];
+        for (std::vector<BoundsCheck*>::iterator chkI = checks->begin(); chkI != checks->end(); chkI++) {
+          BoundsCheck *check = *chkI;
+          if (check->stillExists()) {
+            Value* var = check->getVariable();
+            if (var != NULL) {
+              checkVars.insert(var);
+            }
+          }
+        }
+      }
+
+      #if DEBUG_LOOP
+        errs() << "Creating Preheader Flow Block: " << PreHeader->getName() << "\n";
+      #endif
+      flows[PreHeader] = new VarFlow(PreHeader, (*blkCG)[PreHeader], &checkVars, &flows, true, false);
+      #if DEBUG_LOOP
+        errs() << "Creating Exit Flow Block: " << ExitBlock->getName() << "\n";
+      #endif
+      flows[ExitBlock] = new VarFlow(ExitBlock, (*blkCG)[ExitBlock], &checkVars, &flows, false, true);
+      for (Loop::block_iterator loopBlkI = loop->block_begin(), loopBlkE = loop->block_end(); loopBlkI != loopBlkE; ++loopBlkI) {
+        BasicBlock *loopBlk = *loopBlkI;
+        ConstraintGraph *cg = (*blkCG)[loopBlk];
+      #if DEBUG_LOOP
+        errs() << "Creating Var Flow for Block: " << loopBlk->getName() << "\n";
+      #endif
+        flows[loopBlk] = new VarFlow(loopBlk, cg, &checkVars, &flows, false, false);
+      }
+    #if DEBUG_LOOP
+      int iteration = 0;
+    #endif
+      bool changes = false;
+      do {
+        changes = false;
+      #if DEBUG_LOOP
+         errs() << "Running iteration: " << iteration++ << "\n";
+      #endif
+        for (std::map<BasicBlock*,VarFlow*>::iterator it = flows.begin(), et = flows.end(); it != et; it++) {
+        #if DEBUG_LOOP
+          errs() << "Generating In Set: " << it->first->getName() << "\n";
+          it->second->printInSet();
+        #endif
+          changes |= it->second->identifyOutSet();
+        #if DEBUG_LOOP
+          errs() << "Generating Out Set: " << it->first->getName() << "\n";
+          it->second->printOutSet();
+        #endif
+        }
+      } while (changes);
+    #if DEBUG_LOOP
+      errs() << "Identified Monotonic Changes...\n";
+      flows[ExitBlock]->printInSet();
+    #endif
+
+      std::map<Value*,VarFlow::Change> changeSet;
+      flows[ExitBlock]->copyInSetTo(&changeSet);
+      for (Loop::block_iterator loopBlkI = loop->block_begin(), loopBlkE = loop->block_end(); loopBlkI != loopBlkE; ++loopBlkI) {
+        BasicBlock *loopBlk = *loopBlkI;
+        std::vector<BoundsCheck*> *checks = (*blkChecks)[loopBlk];
+        ConstraintGraph *cg = (*blkCG)[loopBlk];
+        for (std::vector<BoundsCheck*>::iterator chkI = checks->begin(); chkI != checks->end(); chkI++) {
+          BoundsCheck *check = *chkI;
+          if (check->stillExists()) {
+            Value *var = check->getVariable();
+            if (var != NULL && check->comparisonKnown) {
+              switch (changeSet[var]) {
+                case VarFlow::EQUALS:
+                  errs() << "Identified Bounds Check for non-changing variable. This should not occur due to invariant check motion that occurred previously.\n";
+                  break;
+                case VarFlow::INCREASING:
+                  // Only move lower-bound check out, if we know that the computed index is larger than the var
+                  if (check->comparedToVar >= 0) {
+                    BoundsCheck *monCheck = check->createCopyAt(PreHeader);
+                    monCheck->deleteUpperBoundsCheck(); // Not using upper bound check for monotonic check
+                    // Find path from load to index
+                  #if DEBUG_LOOP
+                    errs() << "===========================\n";
+                    errs() << "--Identified Monotonic Increasing LB Move\n";
+                    monCheck->print();
+                  #endif
+                    if (cg->findDependencyPath(monCheck->getIndex(), &(monCheck->dependentInsts))) {
+                      check->deleteLowerBoundsCheck();
+                      preheaderChecks->push_back(monCheck);
+                    } else {
+                  #if DEBUG_LOOP
+                    errs() << "Could not find dependent instructions path. Did not add check";
+                  #endif
+                      delete monCheck;
+                    }
+                  }
+                  break;
+                case VarFlow::DECREASING:
+                  // Only move upper-bound check out, if we know that the computed index is smaller than the var
+                  if (check->comparedToVar <=0) {
+                    BoundsCheck *monCheck = check->createCopyAt(PreHeader);
+                    check->deleteUpperBoundsCheck(); // Delete upper bound that is being replaced
+                    monCheck->deleteLowerBoundsCheck(); // Don't need lower bound
+                    // Find path from load to index
+                  #if DEBUG_LOOP
+                    errs() << "===========================\n";
+                    errs() << "--Identified Monotonic Increasing UB Move\n";
+                    monCheck->print();
+                  #endif
+                    if (cg->findDependencyPath(monCheck->getIndex(), &(monCheck->dependentInsts))) {
+                      check->deleteLowerBoundsCheck();
+                      preheaderChecks->push_back(monCheck);
+                    } else {
+                  #if DEBUG_LOOP
+                    errs() << "Could not find dependent instructions path. Did not add check";
+                  #endif
+                      delete monCheck;
+                    }
+                  }
+                  break;
+                default:
+                  // Can't do anything for unknown case
+                  break;
+              }
+            }          
+          }
+        }
+      } 
     }
   }
   for (std::vector<BasicBlock*>::iterator i = worklist->begin(), e = worklist->end(); i != e; i++) {
@@ -1112,6 +1240,8 @@ void BoundsChecking::LoopAnalysis(std::vector<BasicBlock*> *worklist, std::map<B
       hoistCheck(*ci);
     }
   }
+
+
 }
 
 bool BoundsChecking::runOnFunction(Function &F) {
@@ -1175,17 +1305,104 @@ bool BoundsChecking::runOnFunction(Function &F) {
   return MadeChange;
 }
 
-FunctionPass *llvm::createBoundsCheckingPass(unsigned Penalty) {
-  return new BoundsChecking(Penalty);
+bool BoundsChecking::handleCopyCheck(BoundsCheck* check)
+{
+  if (!check->isCopy()) {
+    return false;
+  }
+
+  std::vector<Instruction*> *insts = &(check->dependentInsts);
+  Builder->SetInsertPoint(check->getInsertPoint());
+  
+  if (insts->empty()) {
+    errs() << "Copy Check did not have any dependent instructions. Restoring Original Check\n";
+    check->restoreOriginalCheck();
+  }
+
+
+  int i = ((int)insts->size())-1;
+  Instruction *I = insts->at(i);
+  Value *prevValue = NULL;
+  std::vector<Instruction*> addedInsts;
+  if (isa<LoadInst>(I)) {
+    LoadInst* LI = dyn_cast<LoadInst>(I);
+    prevValue = Builder->CreateLoad(LI->getPointerOperand());
+    addedInsts.push_back(dyn_cast<Instruction>(prevValue));
+  } else {
+    errs() << "Expected original instruction to be LOAD\n";
+    check->restoreOriginalCheck();
+  }
+  i--;
+  for (; i >= 0; i--) {
+    I = insts->at(i);
+    bool error = false;
+    Value *op1 = NULL;
+    Value *op2 = NULL;
+    if(isa<BinaryOperator>(I)) {
+      BinaryOperator* BO = dyn_cast<BinaryOperator>(I);
+      ConstantInt* c1 = dyn_cast<ConstantInt>(BO->getOperand(0));
+      ConstantInt* c2 = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if ((c1 == NULL) && (c2 == NULL)) {
+        error = true;
+      } else if (c1 != NULL) {
+        op1 = BO->getOperand(0);
+        op2 = prevValue;
+      } else if (c2 != NULL) {
+        op1 = prevValue;
+        op2 = BO->getOperand(1);
+      } else {
+        errs() << "Met Binary operator instruction with constant operands: " << *I << "\n";
+        op1 = BO->getOperand(0);
+        op2 = BO->getOperand(1);
+      }
+      
+      if (!error)
+        prevValue = Builder->CreateBinOp(BO->getOpcode(), op1, op2);
+    } else if (isa<CastInst>(I)) {
+      CastInst *CI = dyn_cast<CastInst>(I);
+      prevValue = Builder->CreateCast(CI->getOpcode(), prevValue, CI->getDestTy());
+    } else {
+      errs() << "[MODULE BROKEN] COULD NOT COPY FOLLOWING INSTRUCTION: " << *I << "n";
+      error = true;
+    }
+    if (error) {
+      check->restoreOriginalCheck();
+      for (std::vector<Instruction*>::iterator i = addedInsts.begin(), e = addedInsts.end(); i != e; i++) {
+        (*i)->eraseFromParent();
+      }
+      return false;
+    } else {
+      addedInsts.push_back(dyn_cast<Instruction>(prevValue));
+    }
+  }
+  if (addedInsts.empty()) {
+    return false;
+  } else {
+    if (check->hasLowerBoundsCheck()) {
+      check->setIndex(prevValue);
+    } else {
+      check->setOffset(prevValue);
+
+    }
+    return true;
+  }
 }
 
 bool BoundsChecking::InsertCheck(BoundsCheck* check) {
   if (!check->stillExists())
     return false;
- 
+
+  bool MadeChanges = false;
+  if (check->isCopy()) {
+    if (!handleCopyCheck(check)) {
+      return false;
+    } else {
+      MadeChanges = true;
+    }
+  }
 #if DEBUG_INSERT
-  check->print();
   errs() << "===================================\n";
+  check->print();
 #endif
   Inst = check->getInstruction(); 
   Value *Size = check->getUpperBound();
@@ -1216,9 +1433,9 @@ bool BoundsChecking::InsertCheck(BoundsCheck* check) {
 
   if (llvmCheck != NULL) {
     emitBranchToTrap(llvmCheck);
-    return true;
+    MadeChanges = true;
   }
-  return false;
+  return MadeChanges;
 }
 
 bool BoundsChecking::InsertChecks(std::vector<BoundsCheck*> *boundsChecks) {
@@ -1228,4 +1445,8 @@ bool BoundsChecking::InsertChecks(std::vector<BoundsCheck*> *boundsChecks) {
     MadeChange |= InsertCheck(*i);
   }  
   return MadeChange;
+}
+
+FunctionPass *llvm::createBoundsCheckingPass(unsigned Penalty) {
+  return new BoundsChecking(Penalty);
 }
